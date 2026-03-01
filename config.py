@@ -19,3 +19,6 @@ SESSION_TIMEOUT_MINUTES = int(getenv("SESSION_TIMEOUT_MINUTES", "10"))
 CHECKLIST_FORMAT = getenv("CHECKLIST_FORMAT", "pdf").lower()
 if CHECKLIST_FORMAT not in ("pdf", "png"):
     CHECKLIST_FORMAT = "pdf"
+
+# Порог confidence: при значении ниже — запрос перезагрузки или fallback-OCR
+CONFIDENCE_THRESHOLD = int(getenv("CONFIDENCE_THRESHOLD", "70"))

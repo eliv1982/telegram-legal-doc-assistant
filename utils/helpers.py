@@ -51,6 +51,22 @@ def parse_response_sections(text: str) -> dict[str, str]:
     return sections
 
 
+def parse_confidence(value: Any) -> int:
+    """
+    Парсит confidence из анализа (строка "85%", число 85 и т.д.).
+    :return: число 0–100 или 100 при ошибке
+    """
+    if value is None:
+        return 100
+    if isinstance(value, (int, float)):
+        return max(0, min(100, int(value)))
+    s = str(value).strip().rstrip("%")
+    try:
+        return max(0, min(100, int(float(s))))
+    except ValueError:
+        return 100
+
+
 def extract_json_from_text(text: str) -> dict[str, Any] | None:
     """
     Извлекает JSON из текста (на случай если модель обернула в markdown).

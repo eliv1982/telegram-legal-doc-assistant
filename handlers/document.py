@@ -14,8 +14,9 @@ from aiogram.fsm.context import FSMContext
 from states.user_states import UserSessionState
 from services.openai_service import OpenAIService
 from services.tts_service import TTSService
-from services.pdf_converter import pdf_first_page_to_image, image_to_bytes
+from services.pdf_converter import pdf_first_page_to_image, image_to_bytes, extract_text_from_pdf
 from services.checklist_generator import generate_checklist
+from utils.helpers import parse_confidence
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -27,6 +28,10 @@ ALLOWED_MIME_IMAGE = {"image/jpeg", "image/png", "image/webp"}
 ERROR_MSG = "Произошла ошибка при обработке. Попробуйте позже."
 WAIT_DOC_MSG = "✅ Голос получен. Отправь документ (PDF или изображение)."
 WAIT_VOICE_MSG = "✅ Документ получен. Отправь голосовое сообщение с задачей."
+LOW_CONFIDENCE_MSG = (
+    "⚠️ Качество распознавания документа низкое. Отправьте документ заново в лучшем разрешении "
+    "(чёткая фотография или скан) или попробуйте PDF с текстовым слоем."
+)
 
 
 async def run_pipeline(
@@ -67,16 +72,37 @@ async def run_pipeline(
 
         # 3. Анализ
         analysis = await openai_service.analyze_document(transcript, document_text)
+        confidence = parse_confidence(analysis.get("confidence"))
+
+        # 3.1 Проверка confidence: при низком — fallback (PDF) или запрос перезагрузки
+        if confidence < config.CONFIDENCE_THRESHOLD:
+            fallback_text = ""
+            if doc_ext == ".pdf":
+                fallback_text = extract_text_from_pdf(doc_path)
+            if fallback_text and len(fallback_text) > 100:
+                document_text = fallback_text
+                analysis = await openai_service.analyze_document(transcript, document_text)
+                confidence = parse_confidence(analysis.get("confidence"))
+                logger.info("Used fallback PDF OCR, new confidence: %s", confidence)
+            if confidence < config.CONFIDENCE_THRESHOLD:
+                await status_msg.delete()
+                await bot.send_message(user_id, LOW_CONFIDENCE_MSG)
+                return
+
         doc_type = analysis.get("document_type", "документ")
         user_task = analysis.get("user_task", transcript[:200])
-        # Поддержка нового (issues_found — список строк) и старого (issues — список dict) формата
+        # Поддержка issues_found (список dict с description/priority или строк) и issues (старый формат)
         issues_raw = analysis.get("issues_found")
         if issues_raw is None:
-            issues_raw = [
-                i.get("description", str(i)) if isinstance(i, dict) else str(i)
-                for i in analysis.get("issues", [])
-            ]
-        issues = [str(x) for x in issues_raw]
+            issues_raw = analysis.get("issues", [])
+        issues = []
+        for x in issues_raw:
+            if isinstance(x, dict):
+                desc = x.get("description", str(x))
+                prio = x.get("priority", "")
+                issues.append(f"[{prio}] {desc}" if prio else desc)
+            else:
+                issues.append(str(x))
 
         # 4. Пост-обработка
         sections = await openai_service.generate_response_sections(

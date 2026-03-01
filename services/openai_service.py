@@ -9,8 +9,8 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from prompts.analysis_prompt import ANALYSIS_PROMPT, DOCUMENT_OCR_PROMPT
-from prompts.response_prompt import RESPONSE_PROMPT
+from prompts.analysis_prompt import ANALYSIS_PROMPT, DOCUMENT_OCR_PROMPT, RISK_SCALE
+from prompts.response_prompt import RESPONSE_PROMPT, RISK_SCALE_RESPONSE
 from utils.helpers import extract_json_from_text
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ class OpenAIService:
         prompt = ANALYSIS_PROMPT.format(
             voice_transcript=voice_transcript,
             document_text=document_text[:15000],  # ограничение на токены
+            risk_scale=RISK_SCALE,
         )
         response = await self._client.chat.completions.create(
             model=ANALYSIS_MODEL,
@@ -115,6 +116,7 @@ class OpenAIService:
             document_type=document_type,
             user_task=user_task,
             issues_list=json.dumps(issues_list, ensure_ascii=False),
+            RISK_SCALE_RESPONSE=RISK_SCALE_RESPONSE,
         )
         response = await self._client.chat.completions.create(
             model=RESPONSE_MODEL,

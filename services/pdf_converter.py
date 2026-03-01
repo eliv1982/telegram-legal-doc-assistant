@@ -1,14 +1,34 @@
 """
 Конвертация PDF в изображение для передачи в GPT-4 Vision.
+Fallback: извлечение текста из PDF через pypdf (без Vision).
 """
 import io
 import logging
 from pathlib import Path
 
 from pdf2image import convert_from_path
+from pypdf import PdfReader
 from PIL import Image
 
 logger = logging.getLogger(__name__)
+
+
+def extract_text_from_pdf(pdf_path: str | Path) -> str:
+    """
+    Fallback-OCR: извлечение текста из PDF без Vision (для скан-документов даст пустой результат).
+    :return: извлечённый текст или пустая строка
+    """
+    try:
+        reader = PdfReader(str(pdf_path))
+        text_parts = []
+        for page in reader.pages[:5]:  # первые 5 страниц
+            t = page.extract_text()
+            if t:
+                text_parts.append(t)
+        return "\n\n".join(text_parts).strip() if text_parts else ""
+    except Exception as e:
+        logger.warning("Fallback PDF extract failed: %s", e)
+        return ""
 
 # DPI для уменьшения размера (Vision имеет ограничения)
 DEFAULT_DPI = 200
