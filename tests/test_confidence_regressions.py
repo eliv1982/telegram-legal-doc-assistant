@@ -11,6 +11,7 @@ import config
 from handlers.document import LOW_CONFIDENCE_MSG, run_pipeline
 from services import openai_service
 from services.openai_service import OpenAIService
+from tests import samples
 from tests.fakes import FakeBot, FakeOpenAIClient, FakeTTSService
 from utils.helpers import parse_confidence
 
@@ -58,7 +59,7 @@ async def test_malformed_model_output_is_not_reported_as_low_document_quality(tm
     voice_path = tmp_path / "voice.ogg"
     doc_path = tmp_path / "doc.png"
     voice_path.write_bytes(b"placeholder")
-    doc_path.write_bytes(b"placeholder")
+    doc_path.write_bytes(samples.png_bytes())  # since Stage 3 the pipeline decodes the upload, so it must be a real image
     bot = FakeBot()
 
     await run_pipeline(bot, 1, voice_path, doc_path, service, FakeTTSService(), "pdf")

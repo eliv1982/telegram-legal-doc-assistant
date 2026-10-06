@@ -12,6 +12,16 @@ from types import SimpleNamespace
 from aiogram.fsm.storage.base import BaseEventIsolation, StorageKey
 from aiogram.types import Chat, Document, Message, Update, User, Voice
 
+from tests import samples
+
+# What FakeBot.download_file serves by destination suffix; a voice file (.ogg) stays an opaque placeholder.
+SAMPLE_FILES: dict[str, Callable[[], bytes]] = {
+    ".png": samples.png_bytes,
+    ".jpg": samples.jpeg_bytes,
+    ".jpeg": samples.jpeg_bytes,
+    ".webp": samples.webp_bytes,
+    ".pdf": samples.text_pdf,
+}
 
 # Shaped like a real bot token (<id>:<35 chars>) but made up; used to prove tokens never reach the logs.
 FAKE_BOT_TOKEN = "123456789:AAFakeTokenForTests-abcdefghijklmnop_QRS"
@@ -28,7 +38,10 @@ class FakeStatusMessage:
 
 
 class FakeBot:
-    """Records what the pipeline would have sent; `download_file` just writes a placeholder file."""
+    """
+    Records what the pipeline would have sent. `download_file` writes a file the validation layer accepts for
+    the destination's type (a real tiny PNG/JPEG/WEBP/PDF), or exactly the bytes a test registered in `payloads`.
+    """
 
     id = 42  # what aiogram's FSM middleware reads from a real Bot
 
@@ -38,6 +51,8 @@ class FakeBot:
         self.sent_documents: list[object] = []
         # Lets a test hold a download open (see test_fsm_regressions.py) without any sleeps.
         self.before_download: Callable[[str], Awaitable[None]] | None = None
+        # remote path ("remote/<file_id>") -> bytes to serve instead of the default sample for the file type
+        self.payloads: dict[str, bytes] = {}
 
     async def __call__(self, method, request_timeout=None) -> FakeStatusMessage:
         """Bound shortcuts such as `Message.answer` (only used when updates go through a Dispatcher)."""
@@ -50,7 +65,9 @@ class FakeBot:
     async def download_file(self, file_path: str, destination: str | Path) -> None:
         if self.before_download is not None:
             await self.before_download(file_path)
-        Path(destination).write_bytes(b"placeholder:" + file_path.encode())
+        destination = Path(destination)
+        default = SAMPLE_FILES.get(destination.suffix.lower(), lambda: b"placeholder:" + file_path.encode())()
+        destination.write_bytes(self.payloads.get(file_path, default))
 
     async def send_message(self, chat_id: int, text: str, **kwargs) -> FakeStatusMessage:
         self.sent_texts.append(text)
@@ -76,26 +93,45 @@ class FakeMessage:
         self.answers.append(text)
 
     @classmethod
-    def with_voice(cls, unique_id: str = "v1", user_id: int = 1) -> "FakeMessage":
-        voice = SimpleNamespace(file_id=f"voice-{unique_id}", file_unique_id=unique_id)
+    def with_voice(cls, unique_id: str = "v1", user_id: int = 1, file_size: int | None = None) -> "FakeMessage":
+        voice = SimpleNamespace(file_id=f"voice-{unique_id}", file_unique_id=unique_id, file_size=file_size)
         return cls(user_id=user_id, voice=voice)
 
     @classmethod
-    def with_document(cls, file_name: str = "contract.png", unique_id: str = "d1", user_id: int = 1) -> "FakeMessage":
-        document = SimpleNamespace(file_name=file_name, file_id=f"doc-{unique_id}", file_unique_id=unique_id)
+    def with_document(
+        cls, file_name: str | None = "contract.png", unique_id: str = "d1", user_id: int = 1,
+        file_size: int | None = None, mime_type: str | None = None,
+    ) -> "FakeMessage":
+        document = SimpleNamespace(
+            file_name=file_name, file_id=f"doc-{unique_id}", file_unique_id=unique_id,
+            file_size=file_size, mime_type=mime_type,
+        )
         return cls(user_id=user_id, document=document)
 
 
 class FakeOpenAIService:
-    """Stands in for services.openai_service.OpenAIService when the pipeline itself is under test."""
+    """
+    Stands in for services.openai_service.OpenAIService when the pipeline itself is under test.
+    `calls` lists every (paid) method that was reached, in order; an empty list proves nothing was paid for.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.ocr_images: list[bytes] = []  # what Vision was asked to read
+        self.analysis_inputs: list[str] = []  # the document text the analysis model was given
 
     async def transcribe_voice(self, audio_path) -> str:
+        self.calls.append("transcribe_voice")
         return "Проверь договор на риски"
 
     async def extract_text_from_image(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
+        self.calls.append("extract_text_from_image")
+        self.ocr_images.append(image_bytes)
         return "Текст договора"
 
     async def analyze_document(self, voice_transcript: str, document_text: str) -> dict:
+        self.calls.append("analyze_document")
+        self.analysis_inputs.append(document_text)
         return {
             "document_type": "Договор",
             "confidence": 92,
@@ -104,11 +140,16 @@ class FakeOpenAIService:
         }
 
     async def generate_response_sections(self, **kwargs) -> dict[str, str]:
+        self.calls.append("generate_response_sections")
         return {"text_report": "Отчёт", "tts_script": "Резюме", "checklist": "□ Проверить контрагента"}
 
 
 class FakeTTSService:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def text_to_speech(self, text: str) -> bytes:
+        self.calls += 1
         return b"ID3placeholder"
 
 
@@ -122,6 +163,7 @@ class FakeOpenAIClient:
         self._chat_replies = list(chat_replies)
         self._transcript = transcript
         self.chat_calls = 0
+        self.transcribe_calls = 0
         self.speech_calls: list[dict] = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat_create))
         self.audio = SimpleNamespace(
@@ -135,6 +177,7 @@ class FakeOpenAIClient:
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     async def _transcribe(self, **kwargs) -> str:
+        self.transcribe_calls += 1
         return self._transcript
 
     async def _speech(self, **kwargs) -> SimpleNamespace:

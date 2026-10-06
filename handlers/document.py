@@ -1,6 +1,7 @@
 """
 Обработка голосовых сообщений и документов. Связывание в сессию и запуск пайплайна.
 """
+import asyncio
 import logging
 import time
 from contextlib import suppress
@@ -20,10 +21,18 @@ from states.user_states import (
     discard_session,
     session_expired,
 )
+from services import limits
 from services.openai_service import OpenAIService
 from services.tts_service import TTSService
-from services.pdf_converter import pdf_first_page_to_image, image_to_bytes, extract_text_from_pdf
 from services.checklist_generator import generate_checklist
+from services.document_extraction import extract_document, format_coverage
+from services.validation import (
+    Rejection,
+    ValidatedDocument,
+    exceeds_upload_limit,
+    validate_document,
+    validate_voice,
+)
 from services.workspace import SessionWorkspace
 from utils.helpers import parse_confidence
 from utils.logging_config import log_failure
@@ -31,9 +40,12 @@ from utils.logging_config import log_failure
 router = Router()
 logger = logging.getLogger(__name__)
 
-# Расширения для документов
+# Отсев очевидно лишнего ДО скачивания по тому, что заявил Telegram. Принимает файл не он: тип по-настоящему
+# определяет services.validation по содержимому.
 ALLOWED_DOC_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
-ALLOWED_MIME_IMAGE = {"image/jpeg", "image/png", "image/webp"}
+MIME_TO_EXT = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+REPORT_CHAR_LIMIT = 4000  # с запасом до лимита Telegram в 4096; строка охвата в него входит
 
 ERROR_MSG = "Произошла ошибка при обработке. Попробуйте позже."
 DOWNLOAD_ERROR_MSG = "Не удалось получить файл из Telegram. Отправьте его ещё раз."
@@ -44,6 +56,44 @@ LOW_CONFIDENCE_MSG = (
     "⚠️ Качество распознавания документа низкое. Отправьте документ заново в лучшем разрешении "
     "(чёткая фотография или скан) или попробуйте PDF с текстовым слоем."
 )
+
+# Постоянные отказы: дело в самом файле, поэтому нет «попробуйте позже», а есть что с ним сделать.
+# Временные сбои OpenAI/Telegram идут отдельным путём (ERROR_MSG, DOWNLOAD_ERROR_MSG).
+REJECTION_MESSAGES: dict[Rejection, str] = {
+    Rejection.UNSUPPORTED_TYPE: "Не удалось распознать файл как PDF или изображение. Поддерживаются PDF, JPG, PNG и WEBP.",
+    Rejection.EMPTY: "Файл пустой. Отправьте другой файл.",
+    Rejection.TOO_LARGE: (
+        f"Файл слишком большой: максимум {limits.MAX_UPLOAD_BYTES // (1024 * 1024)} МБ. "
+        "Отправьте файл меньшего размера."
+    ),
+    Rejection.CORRUPT_PDF: "Не удалось прочитать PDF: файл повреждён или в нём нет страниц. Отправьте другой файл.",
+    Rejection.ENCRYPTED_PDF: "PDF защищён паролем, такие файлы не поддерживаются. Снимите защиту и отправьте файл снова.",
+    Rejection.TOO_MANY_PAGES: (
+        f"В PDF слишком много страниц: максимум {limits.MAX_PDF_PAGES}. "
+        "Отправьте нужные страницы отдельным файлом."
+    ),
+    Rejection.PAGE_SIZE: (
+        "Размер страниц в PDF выходит за допустимые пределы. "
+        "Сохраните документ в обычном формате (например, A4) и отправьте снова."
+    ),
+    Rejection.UNREADABLE_IMAGE: "Не удалось открыть изображение: файл повреждён или слишком мал. Отправьте другое изображение.",
+    Rejection.IMAGE_SIZE: (
+        f"Изображение слишком большое по разрешению: максимум {limits.MAX_IMAGE_PIXELS // 1_000_000} Мп. "
+        "Уменьшите его и отправьте снова."
+    ),
+    Rejection.RENDER_FAILED: (
+        "Не удалось подготовить страницы PDF к анализу. "
+        "Отправьте документ другим файлом, например изображениями страниц."
+    ),
+    Rejection.RENDER_TIMEOUT: (
+        "Обработка PDF заняла слишком много времени и была остановлена. "
+        "Отправьте файл попроще: с меньшим числом страниц или изображениями страниц."
+    ),
+    Rejection.NO_TEXT: (
+        "В документе не удалось найти читаемый текст. "
+        "Отправьте более чёткий скан или фото либо PDF с текстовым слоем."
+    ),
+}
 
 
 async def run_pipeline(
@@ -56,48 +106,43 @@ async def run_pipeline(
     checklist_format: str,
 ) -> None:
     """
-    Полный пайплайн: транскрибация → OCR → анализ → пост-обработка → TTS → чек-лист → отправка.
+    Полный пайплайн: проверка файлов → извлечение документа → транскрибация → анализ → пост-обработка → TTS →
+    чек-лист → отправка. Проверка и извлечение идут до Whisper, поэтому за транскрибацию задачи к непригодному
+    документу платить не приходится; сама проверка бесплатна и локальна.
     """
     try:
         status_msg = await bot.send_message(user_id, "⏳ Обрабатываю…")
-        # 1. Транскрибация голоса
+
+        # 1. Проверка файлов (до любых платных вызовов; повторяет проверку при загрузке: run_pipeline самодостаточен)
+        document = await asyncio.to_thread(_validate_inputs, doc_path, voice_path)
+        if isinstance(document, Rejection):
+            await _send_rejection(bot, user_id, status_msg, document)
+            return
+
+        # 2. Извлечение текста документа: текстовый слой, Vision только для страниц без него
+        extraction = await extract_document(document, openai_service.extract_text_from_image)
+        if isinstance(extraction, Rejection):
+            await _send_rejection(bot, user_id, status_msg, extraction)
+            return
+        logger.info(
+            "Document text: %d chars, pages %d of %d",
+            len(extraction.extracted_text), len(extraction.analysed_pages), extraction.total_pages,
+        )
+
+        # 3. Транскрибация голоса
         transcript = await openai_service.transcribe_voice(voice_path)
         logger.info("Transcribed: %d chars", len(transcript))
 
-        # 2. Извлечение текста документа
-        doc_ext = doc_path.suffix.lower()
-        if doc_ext == ".pdf":
-            image_bytes = pdf_first_page_to_image(doc_path)
-            mime = "image/jpeg"
-        else:
-            image_bytes, _ = image_to_bytes(doc_path)
-            mime = {
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".png": "image/png",
-                ".webp": "image/webp",
-            }.get(doc_ext, "image/jpeg")
-        document_text = await openai_service.extract_text_from_image(image_bytes, mime)
-        logger.info("Document text length: %d", len(document_text))
-
-        # 3. Анализ
-        analysis = await openai_service.analyze_document(transcript, document_text)
+        # 4. Анализ
+        analysis = await openai_service.analyze_document(transcript, extraction.analysis_text)
         confidence = parse_confidence(analysis.get("confidence"))
 
-        # 3.1 Проверка confidence: при низком — fallback (PDF) или запрос перезагрузки
+        # 4.1 Проверка confidence: при низком — запрос перезагрузки. Повторный разбор текстового слоя
+        # здесь не нужен: текстовый слой PDF теперь читается первым (см. services.document_extraction).
         if confidence < config.CONFIDENCE_THRESHOLD:
-            fallback_text = ""
-            if doc_ext == ".pdf":
-                fallback_text = extract_text_from_pdf(doc_path)
-            if fallback_text and len(fallback_text) > 100:
-                document_text = fallback_text
-                analysis = await openai_service.analyze_document(transcript, document_text)
-                confidence = parse_confidence(analysis.get("confidence"))
-                logger.info("Used fallback PDF OCR, new confidence: %s", confidence)
-            if confidence < config.CONFIDENCE_THRESHOLD:
-                await status_msg.delete()
-                await bot.send_message(user_id, LOW_CONFIDENCE_MSG)
-                return
+            await status_msg.delete()
+            await bot.send_message(user_id, LOW_CONFIDENCE_MSG)
+            return
 
         doc_type = analysis.get("document_type", "документ")
         user_task = analysis.get("user_task", transcript[:200])
@@ -114,7 +159,7 @@ async def run_pipeline(
             else:
                 issues.append(str(x))
 
-        # 4. Пост-обработка
+        # 5. Пост-обработка
         sections = await openai_service.generate_response_sections(
             analysis_json=analysis,
             document_type=doc_type,
@@ -125,17 +170,19 @@ async def run_pipeline(
         tts_script = sections.get("tts_script", "Анализ завершён.")
         checklist_text = sections.get("checklist", "□ Результаты анализа")
 
-        # 5. TTS
+        # 6. TTS
         tts_bytes = await tts_service.text_to_speech(tts_script)
 
-        # 6. Чек-лист
-        checklist_bytes = generate_checklist(checklist_text, output_format=checklist_format)
+        # 7. Чек-лист (reportlab/Pillow блокируют поток, поэтому в отдельный поток)
+        checklist_bytes = await asyncio.to_thread(generate_checklist, checklist_text, output_format=checklist_format)
         checklist_ext = "pdf" if checklist_format == "pdf" else "png"
 
-        # 7. Отправка
+        # 8. Отправка
         await status_msg.edit_text("📤 Отправляю результат…")
+        # Строка охвата формируется кодом и добавляется после обрезки отчёта, поэтому не может потеряться.
         # Текстовый отчёт (если Markdown вызывает ошибку — отправляем без форматирования)
-        report_text = text_report[:4000]
+        coverage = format_coverage(extraction)
+        report_text = f"{text_report[: REPORT_CHAR_LIMIT - len(coverage) - 2]}\n\n{coverage}"
         try:
             await bot.send_message(user_id, report_text, parse_mode="Markdown")
         except Exception:
@@ -152,6 +199,22 @@ async def run_pipeline(
     except Exception as e:
         log_failure(logger, "pipeline", e)
         await bot.send_message(user_id, ERROR_MSG)
+
+
+def _validate_inputs(doc_path: Path, voice_path: Path) -> ValidatedDocument | Rejection:
+    """Бесплатные локальные проверки обеих половин сессии (блокирующая: вызывать через asyncio.to_thread)."""
+    document = validate_document(doc_path)
+    if isinstance(document, Rejection):
+        return document
+    voice_rejection = validate_voice(voice_path)
+    return document if voice_rejection is None else voice_rejection
+
+
+async def _send_rejection(bot: Bot, user_id: int, status_msg, reason: Rejection) -> None:
+    logger.info("Input rejected: %s", reason.value)
+    await bot.send_message(user_id, REJECTION_MESSAGES[reason])
+    with suppress(Exception):  # статус «Обрабатываю…» — украшение, его сбой не должен заменять причину отказа
+        await status_msg.delete()
 
 
 async def _reply(message: Message, text: str) -> None:
@@ -175,6 +238,23 @@ async def _download(bot: Bot, file_id: str, dest: Path) -> bool:
     return True
 
 
+async def _accept_upload(message: Message, path: Path, is_voice: bool) -> bool:
+    """
+    Проверка сразу после скачивания: непригодный файл отклоняется немедленно, а не после ожидания второй половины.
+    Платных вызовов здесь нет. При отказе пользователю сообщается причина, а сессия остаётся как была.
+    """
+    if is_voice:
+        rejection = await asyncio.to_thread(validate_voice, path)
+    else:
+        outcome = await asyncio.to_thread(validate_document, path)
+        rejection = outcome if isinstance(outcome, Rejection) else None
+    if rejection is None:
+        return True
+    logger.info("Upload rejected: %s", rejection.value)
+    await _reply(message, REJECTION_MESSAGES[rejection])
+    return False
+
+
 async def _start_or_replace_session(
     message: Message, state: FSMContext, bot: Bot, data: dict,
     file_id: str, is_voice: bool, doc_ext: str,
@@ -188,6 +268,8 @@ async def _start_or_replace_session(
         if not await _download(bot, file_id, incoming):
             await _reply(message, DOWNLOAD_ERROR_MSG)
             return
+        if not await _accept_upload(message, incoming, is_voice):
+            return  # отклонённый файл не заменяет уже ожидающий: прежняя сессия остаётся нетронутой
         await state.set_state(
             UserSessionState.waiting_for_document if is_voice else UserSessionState.waiting_for_voice
         )
@@ -222,6 +304,10 @@ async def _complete_session(
     if not await _download(bot, file_id, incoming):
         # Ожидающая половина остаётся в сессии: достаточно отправить файл ещё раз.
         await _reply(message, DOWNLOAD_ERROR_MSG)
+        return
+    if not await _accept_upload(message, incoming, is_voice):
+        with suppress(OSError):
+            incoming.unlink(missing_ok=True)  # ожидающая половина остаётся: достаточно прислать другой файл
         return
 
     voice_path, doc_path = (incoming, Path(pending_file)) if is_voice else (Path(pending_file), incoming)
@@ -265,6 +351,9 @@ async def _receive_input(
 @router.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext, bot: Bot) -> None:
     """Обработка голосового сообщения."""
+    if exceeds_upload_limit(message.voice.file_size):
+        await _reply(message, REJECTION_MESSAGES[Rejection.TOO_LARGE])
+        return
     await _receive_input(message, state, bot, message.voice.file_id, is_voice=True)
 
 
@@ -284,6 +373,11 @@ async def handle_document(message: Message, state: FSMContext, bot: Bot) -> None
     doc = message.document
     ext = Path(doc.file_name or "").suffix.lower()
     if ext not in ALLOWED_DOC_EXTENSIONS:
-        await _reply(message, "Отправьте PDF или изображение (JPG, PNG).")
+        ext = MIME_TO_EXT.get((doc.mime_type or "").lower(), "")
+    if not ext:
+        await _reply(message, REJECTION_MESSAGES[Rejection.UNSUPPORTED_TYPE])
+        return
+    if exceeds_upload_limit(doc.file_size):  # заявленный размер известен до скачивания
+        await _reply(message, REJECTION_MESSAGES[Rejection.TOO_LARGE])
         return
     await _receive_input(message, state, bot, doc.file_id, is_voice=False, doc_ext=ext)

@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 
 from prompts.analysis_prompt import ANALYSIS_PROMPT, DOCUMENT_OCR_PROMPT, RISK_SCALE
 from prompts.response_prompt import RESPONSE_PROMPT, RISK_SCALE_RESPONSE
+from services import limits
 from utils.helpers import extract_json_from_text
 
 logger = logging.getLogger(__name__)
@@ -70,7 +71,9 @@ class OpenAIService:
         """
         prompt = ANALYSIS_PROMPT.format(
             voice_transcript=voice_transcript,
-            document_text=document_text[:15000],  # ограничение на токены
+            # Ограничение на токены. Текст, прошедший services.document_extraction, в него гарантированно умещается
+            # (см. limits.ANALYSIS_CHAR_LIMIT), так что срез никогда не отрезает засчитанные страницы.
+            document_text=document_text[: limits.ANALYSIS_CHAR_LIMIT],
             risk_scale=RISK_SCALE,
         )
         response = await self._client.chat.completions.create(

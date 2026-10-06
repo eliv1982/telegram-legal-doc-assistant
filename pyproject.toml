@@ -48,8 +48,3 @@ extend-exclude = [".venv"]
 [tool.ruff.lint]
 # Ruff defaults (pyflakes F + the pycodestyle E4/E7/E9 subset). Nothing broader on purpose in Stage 1.
 select = ["E4", "E7", "E9", "F"]
-
-[tool.ruff.lint.per-file-ignores]
-# Existing style debt (unused import), listed per file so every other file and rule still blocks CI.
-# Remove this entry when cleaning up.
-"services/pdf_converter.py" = ["F401"]
