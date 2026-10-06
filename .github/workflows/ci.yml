@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the required baseline; 3.13 is a compatibility check of the same locked dependencies.
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      # pdf2image shells out to pdftoppm; do not rely on the runner image shipping it.
+      - name: Install Poppler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends poppler-utils
+          pdftoppm -v
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.23" # the uv that wrote uv.lock
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Lock file matches pyproject.toml
+        run: uv lock --check
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Compile all sources
+        run: uv run python -m compileall -q bot.py config.py handlers prompts services states utils tests
+
+      # No BOT_TOKEN / OPENAI_API_KEY is configured anywhere: the tests are offline and block external network.
+      - name: Tests
+        run: uv run pytest

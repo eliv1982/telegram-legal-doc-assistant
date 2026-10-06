@@ -1,0 +1,58 @@
+[project]
+name = "telegram-legal-doc-assistant"
+version = "0.1.0"
+description = "Telegram bot: voice task + document (PDF/photo) -> text report, voice summary and checklist"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+# 3.12 is the required CI version; 3.13 is covered by a compatibility job.
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "aiogram>=3.13.0",
+    "openai>=1.40.0",
+    "python-dotenv>=1.0.0",
+    "gTTS>=2.5.0",
+    "reportlab>=4.2.0",
+    # Parsers of untrusted uploads: floors sit above the published DoS/memory-safety fixes
+    # (pypdf CVE-2026-59935 / -54531 / -57204 / traversal fixes in 6.16.1; Pillow CVE-2026-25990 / -42309).
+    "Pillow>=12.2.0",
+    "pdf2image>=1.17.0",
+    "pypdf>=6.16.1",
+    # aiofiles is no longer listed: the code never imports it and aiogram depends on it anyway.
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+# Application, not a library: nothing to build or install, only dependencies.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# Known, unfixed defects live in the suite as strict xfails: a fix flips them to XPASS(strict) = red,
+# which forces the xfail marker to be removed together with the fix.
+xfail_strict = true
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+# Ruff defaults (pyflakes F + the pycodestyle E4/E7/E9 subset). Nothing broader on purpose in Stage 1.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Existing style debt (4 unused imports), listed per file so every other file and rule still blocks CI.
+# Left in place on purpose: Stage 1 does not touch runtime source. Remove these entries when cleaning up.
+"handlers/start.py" = ["F401"]
+"services/pdf_converter.py" = ["F401"]
+"services/tts_service.py" = ["F401"]
