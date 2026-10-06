@@ -87,7 +87,7 @@ class OpenAIService:
             try:
                 parsed = json.loads(raw)
             except json.JSONDecodeError:
-                logger.warning("Не удалось распарсить JSON анализа: %s", raw[:200])
+                logger.warning("Не удалось распарсить JSON анализа (ответ модели: %d симв.)", len(raw))
                 parsed = {
                     "document_type": "неизвестно",
                     "confidence": "0%",

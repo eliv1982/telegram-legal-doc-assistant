@@ -61,7 +61,7 @@ async def test_malformed_model_output_is_not_reported_as_low_document_quality(tm
     doc_path.write_bytes(b"placeholder")
     bot = FakeBot()
 
-    await run_pipeline(bot, 1, voice_path, doc_path, service, FakeTTSService(), "gtts", "pdf")
+    await run_pipeline(bot, 1, voice_path, doc_path, service, FakeTTSService(), "pdf")
 
     if client.chat_calls != 2:  # harness check, deliberately not an AssertionError
         pytest.fail(f"expected OCR + analysis calls, got {client.chat_calls}")

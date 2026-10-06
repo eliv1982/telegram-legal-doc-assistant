@@ -27,7 +27,7 @@ def extract_text_from_pdf(pdf_path: str | Path) -> str:
                 text_parts.append(t)
         return "\n\n".join(text_parts).strip() if text_parts else ""
     except Exception as e:
-        logger.warning("Fallback PDF extract failed: %s", e)
+        logger.warning("Fallback PDF extract failed: %s", type(e).__name__)
         return ""
 
 # DPI для уменьшения размера (Vision имеет ограничения)

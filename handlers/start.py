@@ -8,7 +8,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message
 from aiogram.fsm.context import FSMContext
 
-from states.user_states import UserSessionState
+from states.user_states import discard_session
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ WELCOME_TEXT = """
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
-    """Обработка /start."""
-    await state.clear()
+    """Обработка /start: сбрасывает незавершённую сессию вместе с её файлами."""
+    await discard_session(state)
     await message.answer(WELCOME_TEXT, parse_mode="Markdown")
     logger.info("User %s started bot", message.from_user.id if message.from_user else "?")

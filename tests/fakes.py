@@ -3,9 +3,18 @@ Offline stand-ins for Telegram and OpenAI used by the handler/pipeline tests.
 Nothing here opens a socket.
 """
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+from aiogram.fsm.storage.base import BaseEventIsolation, StorageKey
+from aiogram.types import Chat, Document, Message, Update, User, Voice
+
+
+# Shaped like a real bot token (<id>:<35 chars>) but made up; used to prove tokens never reach the logs.
+FAKE_BOT_TOKEN = "123456789:AAFakeTokenForTests-abcdefghijklmnop_QRS"
 
 
 class FakeStatusMessage:
@@ -21,12 +30,19 @@ class FakeStatusMessage:
 class FakeBot:
     """Records what the pipeline would have sent; `download_file` just writes a placeholder file."""
 
+    id = 42  # what aiogram's FSM middleware reads from a real Bot
+
     def __init__(self) -> None:
         self.sent_texts: list[str] = []
         self.sent_voices: list[object] = []
         self.sent_documents: list[object] = []
         # Lets a test hold a download open (see test_fsm_regressions.py) without any sleeps.
         self.before_download: Callable[[str], Awaitable[None]] | None = None
+
+    async def __call__(self, method, request_timeout=None) -> FakeStatusMessage:
+        """Bound shortcuts such as `Message.answer` (only used when updates go through a Dispatcher)."""
+        self.sent_texts.append(method.text)
+        return FakeStatusMessage()
 
     async def get_file(self, file_id: str) -> SimpleNamespace:
         return SimpleNamespace(file_path=f"remote/{file_id}")
@@ -92,7 +108,7 @@ class FakeOpenAIService:
 
 
 class FakeTTSService:
-    async def text_to_speech(self, text: str, lang: str = "ru") -> bytes:
+    async def text_to_speech(self, text: str) -> bytes:
         return b"ID3placeholder"
 
 
@@ -106,8 +122,12 @@ class FakeOpenAIClient:
         self._chat_replies = list(chat_replies)
         self._transcript = transcript
         self.chat_calls = 0
+        self.speech_calls: list[dict] = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat_create))
-        self.audio = SimpleNamespace(transcriptions=SimpleNamespace(create=self._transcribe))
+        self.audio = SimpleNamespace(
+            transcriptions=SimpleNamespace(create=self._transcribe),
+            speech=SimpleNamespace(create=self._speech),
+        )
 
     async def _chat_create(self, **kwargs) -> SimpleNamespace:
         self.chat_calls += 1
@@ -116,6 +136,10 @@ class FakeOpenAIClient:
 
     async def _transcribe(self, **kwargs) -> str:
         return self._transcript
+
+    async def _speech(self, **kwargs) -> SimpleNamespace:
+        self.speech_calls.append(kwargs)
+        return SimpleNamespace(content=b"ID3placeholder")
 
 
 class Gate:
@@ -128,3 +152,44 @@ class Gate:
     async def hold(self) -> None:
         self.reached.set()
         await self.release.wait()
+
+
+class ObservedIsolation(BaseEventIsolation):
+    """
+    Wraps the isolation the app configured and queues every lock request. A test can therefore wait until an
+    update has reached the isolation boundary (running on, or parked behind a running update) without sleeping.
+    """
+
+    def __init__(self, inner: BaseEventIsolation) -> None:
+        self.inner = inner
+        self.requests: asyncio.Queue[StorageKey] = asyncio.Queue()
+
+    @asynccontextmanager
+    async def lock(self, key: StorageKey) -> AsyncGenerator[None, None]:
+        self.requests.put_nowait(key)
+        async with self.inner.lock(key):
+            yield
+
+    async def close(self) -> None:
+        await self.inner.close()
+
+
+def _update(update_id: int, user_id: int, **content) -> Update:
+    message = Message(
+        message_id=update_id,
+        date=datetime(2026, 1, 1),
+        chat=Chat(id=user_id, type="private"),
+        from_user=User(id=user_id, is_bot=False, first_name="Test"),
+        **content,
+    )
+    return Update(update_id=update_id, message=message)
+
+
+def voice_update(update_id: int, user_id: int, unique_id: str = "v1") -> Update:
+    """A real aiogram Update, for tests that go through the Dispatcher."""
+    return _update(update_id, user_id, voice=Voice(file_id=f"voice-{unique_id}", file_unique_id=unique_id, duration=1))
+
+
+def document_update(update_id: int, user_id: int, unique_id: str = "d1", file_name: str = "contract.png") -> Update:
+    document = Document(file_id=f"doc-{unique_id}", file_unique_id=unique_id, file_name=file_name)
+    return _update(update_id, user_id, document=document)

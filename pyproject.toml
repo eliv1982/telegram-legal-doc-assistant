@@ -11,7 +11,6 @@ dependencies = [
     "aiogram>=3.13.0",
     "openai>=1.40.0",
     "python-dotenv>=1.0.0",
-    "gTTS>=2.5.0",
     "reportlab>=4.2.0",
     # Parsers of untrusted uploads: floors sit above the published DoS/memory-safety fixes
     # (pypdf CVE-2026-59935 / -54531 / -57204 / traversal fixes in 6.16.1; Pillow CVE-2026-25990 / -42309).
@@ -51,8 +50,6 @@ extend-exclude = [".venv"]
 select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.lint.per-file-ignores]
-# Existing style debt (4 unused imports), listed per file so every other file and rule still blocks CI.
-# Left in place on purpose: Stage 1 does not touch runtime source. Remove these entries when cleaning up.
-"handlers/start.py" = ["F401"]
+# Existing style debt (unused import), listed per file so every other file and rule still blocks CI.
+# Remove this entry when cleaning up.
 "services/pdf_converter.py" = ["F401"]
-"services/tts_service.py" = ["F401"]

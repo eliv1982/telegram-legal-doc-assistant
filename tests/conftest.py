@@ -1,6 +1,7 @@
 """
 Offline test setup: no secrets, no network.
 """
+import asyncio
 import ipaddress
 import os
 import socket
@@ -14,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from tests.fakes import FakeBot, FakeOpenAIService, FakeTTSService
+from tests.fakes import FakeBot, FakeOpenAIService, FakeTTSService, ObservedIsolation
 
 # config.py calls load_dotenv() at import time. Stub it before anything imports `config`, so a developer's
 # real .env (with live secrets) can never leak into the test process, and drop any ambient settings.
@@ -22,7 +23,6 @@ dotenv.load_dotenv = lambda *args, **kwargs: False
 for _name in (
     "BOT_TOKEN",
     "OPENAI_API_KEY",
-    "TTS_PROVIDER",
     "SESSION_TIMEOUT_MINUTES",
     "CHECKLIST_FORMAT",
     "CONFIDENCE_THRESHOLD",
@@ -42,7 +42,7 @@ def _is_local(host) -> bool:
 @pytest.fixture(autouse=True)
 def _block_external_network(monkeypatch):
     """
-    Telegram, OpenAI and Google (gTTS) are all reached by hostname, so refusing DNS lookups and
+    Telegram and OpenAI are both reached by hostname, so refusing DNS lookups and
     non-loopback connects for every test is enough. Loopback stays open because asyncio's event loop
     uses it internally (socketpair on Windows).
     """
@@ -75,12 +75,13 @@ def _block_external_network(monkeypatch):
 
 @dataclass
 class HandlerEnv:
-    """handlers.document wired to fakes, with every temp file the bot creates redirected into `temp_dir`."""
+    """handlers.document wired to fakes, with every session workspace the bot creates redirected into `temp_dir`."""
 
     bot: FakeBot
     temp_dir: Path
     document: object  # the handlers.document module
     pipeline_calls: list[int] = field(default_factory=list)
+    pipeline_args: list[tuple] = field(default_factory=list)  # (bot, user_id, voice_path, doc_path, ...) per run
     storage: MemoryStorage = field(default_factory=MemoryStorage)
 
     def new_state(self, user_id: int = 1) -> FSMContext:
@@ -95,9 +96,10 @@ def handler_env(monkeypatch, tmp_path) -> HandlerEnv:
     import config
     from handlers import document
 
-    # The handlers build files under tempfile.gettempdir(); point it at the per-test directory.
+    # Session workspaces are created under tempfile.gettempdir(); point it at the per-test directory.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(config, "CONFIDENCE_THRESHOLD", 70)
+    monkeypatch.setattr(config, "SESSION_TIMEOUT_MINUTES", 10)
     monkeypatch.setattr(document, "OpenAIService", lambda **kwargs: FakeOpenAIService())
     monkeypatch.setattr(document, "TTSService", lambda **kwargs: FakeTTSService())
     monkeypatch.setattr(document, "generate_checklist", lambda text, output_format="pdf": b"%PDF-placeholder")
@@ -107,7 +109,49 @@ def handler_env(monkeypatch, tmp_path) -> HandlerEnv:
 
     async def counting_run_pipeline(*args, **kwargs):
         env.pipeline_calls.append(1)
+        env.pipeline_args.append(args)
         return await real_run_pipeline(*args, **kwargs)
 
     monkeypatch.setattr(document, "run_pipeline", counting_run_pipeline)
     return env
+
+
+@dataclass
+class DispatchEnv:
+    """The real Dispatcher from bot.build_dispatcher() (FSM middleware + event isolation) in front of `env`'s handlers."""
+
+    env: HandlerEnv
+    dispatcher: object
+    isolation: ObservedIsolation
+
+    def feed(self, update) -> asyncio.Task:
+        return asyncio.create_task(self.dispatcher.feed_update(self.env.bot, update))
+
+    def state_of(self, user_id: int) -> FSMContext:
+        key = StorageKey(bot_id=self.env.bot.id, chat_id=user_id, user_id=user_id)
+        return FSMContext(storage=self.dispatcher.storage, key=key)
+
+
+@pytest.fixture(scope="session")
+def _app_dispatcher():
+    # The module-level routers attach to a single parent, so the app's dispatcher can be built once per process.
+    from bot import build_dispatcher
+
+    return build_dispatcher()
+
+
+@pytest.fixture
+def dispatch(handler_env, _app_dispatcher, monkeypatch) -> DispatchEnv:
+    # Fresh locks per test (an asyncio.Lock binds to the loop of its first contention), same class as the app's.
+    isolation = ObservedIsolation(type(_app_dispatcher.fsm.events_isolation)())
+    monkeypatch.setattr(_app_dispatcher.fsm, "events_isolation", isolation)
+
+    # aiogram runs sync callbacks (the F.voice / F.document magic filters) via asyncio.to_thread. That is a real
+    # thread hop, so how far a second update gets while the first is parked would depend on thread timing.
+    # Running them inline leaves the test's own Events and the isolation lock as the only suspension points.
+    async def run_inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    yield DispatchEnv(env=handler_env, dispatcher=_app_dispatcher, isolation=isolation)
+    _app_dispatcher.storage.storage.clear()

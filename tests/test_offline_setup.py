@@ -18,6 +18,7 @@ MODULES = [
     "services.openai_service",
     "services.pdf_converter",
     "services.tts_service",
+    "services.workspace",
     "states.user_states",
     "utils.helpers",
     "utils.logging_config",
