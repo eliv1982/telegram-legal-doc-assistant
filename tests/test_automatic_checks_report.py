@@ -1,5 +1,5 @@
 """
-The user-facing automatic-checks section (Stage 5): written by code, placed before the model's assessment, bounded,
+The user-facing automatic-checks section: written by code, placed before the model's assessment, bounded,
 and never able to push the coverage line or the disclaimer out of the 4000-character Telegram message.
 """
 from services.deterministic_checks import CheckStatus, run_deterministic_checks

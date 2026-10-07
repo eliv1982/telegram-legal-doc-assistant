@@ -1,5 +1,5 @@
 """
-Regression ledger: FSM concurrency defect (fixed in Stage 2).
+Regression ledger: FSM concurrency defect (fixed).
 
 aiogram runs each update as its own task. Without events isolation a voice update and a document update from
 one user interleaved and overwrote each other's state. These tests go through the Dispatcher built by

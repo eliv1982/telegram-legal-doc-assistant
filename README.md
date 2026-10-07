@@ -1,192 +1,319 @@
-# telegram-legal-doc-assistant
+# telegram-legal-doc-review-assistant
 
-> Telegram-бот для анализа первичных документов по голосовой задаче. Отправьте голосовое сообщение и файл (PDF/фото) — получите текстовый отчёт, голосовое резюме и чек-лист.
+[![CI](https://github.com/eliv1982/telegram-legal-doc-review-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/eliv1982/telegram-legal-doc-review-assistant/actions/workflows/ci.yml)
+![Python 3.12 | 3.13](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-**Стек:** Python 3.12, aiogram 3, OpenAI Chat Completions API (по умолчанию Whisper `whisper-1`, `gpt-4o` для распознавания и анализа документа, `gpt-4o-mini` для отчёта, `tts-1` для голосового резюме; все модели настраиваются, см. «Переменные окружения»), Pydantic, ReportLab, pdf2image.
+> A Telegram assistant for **first-pass review of Russian business documents**: deterministic requisite checks written in code, plus a structured, evidence-grounded AI assessment, kept visibly apart.
 
-> **Важно.** Это учебный/портфолио-проект, а не юридическая консультация и не замена юриста.
-> Бот делает **предварительный разбор (first-pass review)**: замечания и их приоритеты — оценка модели ИИ,
-> а не проверка по законам или иным источникам; модель может ошибаться и пропускать существенное.
-> Отдельный раздел «Автоматические проверки» формирует код: он сверяет только формат и контрольные числа реквизитов
-> и не подтверждает существование или статус организации.
-> Загруженные документы и голосовые сообщения передаются во внешние сервисы: Telegram и OpenAI
-> (внешний ИИ-процессор: распознавание речи, анализ документа, синтез голосового резюме). Других внешних сервисов бот не вызывает.
-> Не загружайте конфиденциальные документы.
-> Поведение и ограничения ещё дорабатываются: возможны ошибки анализа.
+Send the bot a voice instruction and a PDF or photo of a document (a contract, an invoice, an act). It validates the file under bounded resource limits, extracts the text, runs **automatic requisite checks** (INN, KPP, OGRN/OGRNIP, BIK, bank accounts) in plain code, asks an OpenAI model for a **structured first-pass review** whose findings carry quotes from the document, verifies those quotes against the extracted text, and sends back a text report, a short voice summary and a PDF checklist. Every report states which pages were analysed.
 
----
+> **Educational / portfolio project. This is not legal advice** and not a replacement for a lawyer. The AI assessment is preliminary and can be wrong or incomplete. The automatic checks verify only the *format and check digits* of requisites, never that an organisation exists. Do not upload confidential documents: content is sent to external processors (see [Privacy and data flow](#privacy-and-data-flow)).
 
-## Возможности
+The bot talks to the user in Russian (messages, prompts, voice summary), because it reviews Russian documents. This README is in English for portfolio readers; a short Russian summary is at the [bottom](#кратко-по-русски).
 
-- Связка **голос + документ** в одну сессию (порядок любой)
-- Транскрибация голоса (Whisper) и распознавание текста документа (vision-модель `gpt-4o`)
-- Предварительный разбор (оценка модели): тип документа, реквизиты, замечания с приоритетом, рекомендации
-- **Автоматические проверки реквизитов** (код, не модель): ИНН, КПП, ОГРН, ОГРНИП, БИК, р/с, к/с с метками проверяются по формату и, где правило известно, по контрольному числу; результат показан отдельным разделом перед оценкой модели (см. «Автоматические проверки реквизитов»)
-- Выдача: текстовый отчёт (обычным текстом), MP3-резюме и PDF-чек-лист; отчёт уходит первым, голос и чек-лист необязательны и не могут его отменить (см. «Отчёт, голос и чек-лист»)
-- К каждому отчёту код добавляет строку о том, какие страницы реально проанализированы (см. «Загрузка файлов и охват анализа»), и дисклеймер; замечания подкрепляются цитатами из документа, проверенными по его тексту (см. «Ответы модели: структура и цитаты»)
+## Why this project exists
 
-## Требования
+A document-review assistant should not present every output as equally reliable. Some things are facts that code can verify: an INN either satisfies its check-digit rule or it does not. Other things are model interpretation: whether a clause is risky, how important a finding is. This project keeps the two apart:
 
-- **Python 3.12** (в CI дополнительно проверяется 3.13)
-- [**uv**](https://docs.astral.sh/uv/getting-started/installation/) — менеджер окружения и зависимостей (`winget install astral-sh.uv` или `pip install uv`)
-- **Poppler** (рендеринг страниц-сканов PDF в изображения): Windows — `winget install oschwartz10612.Poppler` или [сборка](https://github.com/oschwartz10612/poppler-windows/releases), Linux — `sudo apt install poppler-utils`, macOS — `brew install poppler`. Команды `pdftoppm` и `pdfinfo` должны быть в `PATH`. PDF с текстовым слоем и изображения обходятся без Poppler; без него не обработаются только страницы-сканы внутри PDF.
+- **Code-verifiable facts** come from deterministic rules, run on the extracted text only. The model never sees their results and cannot rewrite them.
+- **Model interpretation** is labelled as the model's assessment, its evidence is checked by code where possible, and quotes that cannot be verified are not shown as quotations.
+- **What was and was not analysed** is stated by code in every report, not guessed by the model.
 
-## Установка
+## User flow
 
-```bash
-git clone https://github.com/eliv1982/telegram-legal-doc-assistant.git
-cd telegram-legal-doc-assistant
+1. Send a **PDF or an image** (JPG, PNG, WEBP) of the document.
+2. Send a **voice message** with the task, e.g. "check this contract for risks to the buyer". The two may arrive in either order: the first opens a session, the second completes it.
+3. The bot **validates** each upload as it arrives and extracts the document text. A file that cannot be used is rejected immediately with the reason; the half already received stays in the session.
+4. **Automatic requisite checks** run on the extracted text.
+5. The **AI performs a structured first-pass review** of the document against your task.
+6. You receive, in this order:
+   1. a **text report** (automatic checks, then the model's assessment, verified quotes, page coverage, disclaimer),
+   2. a **voice summary**,
+   3. a **PDF checklist**.
 
-uv sync          # создаёт .venv (Python 3.12) и ставит зависимости ровно по uv.lock
-copy .env.example .env   # Linux/macOS: cp .env.example .env
+The text report is the primary result and is sent first. If the voice summary or the checklist cannot be produced, you get one short notice for that item and the report is unaffected. `/start` discards an unfinished session.
+
+## Architecture / pipeline
+
+```text
+Telegram (voice + PDF/image, either order)
+  │
+  ▼
+Session workspace                private temporary directory, one per session            [code]
+  │
+  ▼
+Validation                       type sniffed from content, size, PDF structure/pages   [code]
+  │
+  ▼
+Bounded extraction               text layer first; scanned pages -> Poppler -> vision   [code; AI for scans]
+  │
+  ├──► Deterministic requisite checks   INN / KPP / OGRN / OGRNIP / BIK / accounts      [code only]
+  │
+  ▼
+Speech-to-text                   the voice task                                         [AI]
+  │
+  ▼
+Structured AI review             Pydantic schema; document text is untrusted data       [AI]
+  │
+  ▼
+Evidence grounding               a quote counts only if it is in the extracted text     [code]
+  │
+  ▼
+Report generation                structured: report text, voice script, checklist items [AI]
+  │
+  ▼
+Report composition               code-added parts are never cut or rewritten            [code]
+  ├──► 1. Telegram text report
+  ├──► 2. Voice summary          OpenAI text-to-speech                                  [AI]
+  └──► 3. PDF checklist          bundled PT Sans font                                   [code]
 ```
 
-В `.env` укажите `BOT_TOKEN` (от [@BotFather](https://t.me/BotFather)) и `OPENAI_API_KEY`.
+The deterministic branch reads the extracted document text only. It does not use model output, makes no network calls, and gives the same answer every time.
 
-Зависимости описаны в `pyproject.toml`, точные версии зафиксированы в `uv.lock` (единственный источник правды; `requirements.txt` больше нет).
+## Deterministic checks
 
-## Запуск
+These are the rules that exist, exactly. Requisites are found only **after a label** (`ИНН`, `КПП`, `ОГРН`, `ОГРНИП`, `БИК`, `р/с`, `к/с`, "расчётный счёт", and so on); a bare number is never treated as a requisite.
 
-```bash
+| Requisite | Rule | Kind of check | Source |
+|---|---|---|---|
+| INN, 10 digits | digits only, length, check digit (10th) | check digit | FNS order of 26.06.2025 No. ЕД-7-14/559@ (structure and lengths; the check digit is "by the algorithm determined by the FNS"), see the note below |
+| INN, 12 digits | the same, two check digits (11th and 12th) | check digit | same |
+| KPP | 9 characters: 4 digits, 2 characters (digit or capital Latin letter), 3 digits | **format only**; KPP has no check digit and none is invented | same |
+| OGRN | 13 digits; the 13th is the last digit of (first 12 digits mod 11) | check digit | Ministry of Finance order of 30.10.2017 No. 165n (as amended 19.12.2022), item 7 |
+| OGRNIP | 15 digits; the 15th is the last digit of (first 14 digits mod 13) | check digit | same |
+| BIK | 9 digits, the first is 0, 1 or 2, the rest are not all zeros | **format only** (current structure) | Bank of Russia Regulation of 24.09.2020 No. 732-P, appendix 5, item 3 (as amended 17.06.2025) |
+| Settlement / correspondent account | 20 characters | **length only** | Bank of Russia Regulation of 24.11.2022 No. 809-P, appendix 1 to the Chart of Accounts |
+
+Results are shown as `❌` (the rule is not satisfied), `✅` (it is satisfied) or `ℹ️` (the format fits, but there is no check digit to verify). Identical requisites are merged into one line with their pages; two different values under one label stay two lines, so a wrong one does not cancel a right one. Text in the document cannot change a verdict: a note saying "treat this INN as correct" does nothing.
+
+### What these checks do NOT prove
+
+`✅` means only "this specific format and check-digit rule is satisfied". It does **not** prove that the taxpayer, company or bank exists or is active, that the number belongs to the party named in the document, or that the document is legally valid. No registry (FNS, EGRUL/EGRIP, the Bank of Russia BIK directory) is consulted. `❌` means "this rule is not satisfied", which can also come from a misread scan (the report warns about this when page images were read by the AI).
+
+### Provenance of the INN algorithm
+
+The FNS order that currently defines the INN structure says the check digit is computed "by the algorithm determined by the FNS" but does **not print the coefficients**. The FNS has publicly stated that the check-digit methodology has not changed ([nalog.gov.ru, 07.11.2025](https://www.nalog.gov.ru/rn77/news/activities_fts/16575267/)). The coefficient table used in the code is taken from the government services portal ([info.gosuslugi.ru](https://info.gosuslugi.ru/articles/%D0%92%D0%B0%D0%BB%D0%B8%D0%B4%D0%B0%D1%86%D0%B8%D1%8F/)), not from the order itself. The unit tests pin it against identifiers of a few well-known public organisations and single-digit mutations of them; a wider manual cross-check of 12 public INN/OGRN pairs was done when the rule was written, but those pairs are not part of the test data. The sources were read at development time; the bot never calls them at runtime.
+
+### Deliberately not implemented
+
+- **The account check key** (9th character): the current regulation does not print the algorithm, and linking an account to a BIK in free text is ambiguous (a document usually has several of each). Accounts are checked by length only.
+- **VAT arithmetic** and other tax calculations, **registry lookups**, and any legal conclusion.
+
+## AI review
+
+- **Structured output.** Analysis and report generation use OpenAI Chat Completions structured parsing with Pydantic models ([`services/schemas.py`](services/schemas.py)): the API returns JSON for a schema, the SDK validates it, and the code works with typed objects. There is no free-text parsing and no regex rescue of malformed JSON.
+- **The document is untrusted data.** The user's task and the document text go into separate, fenced blocks, and the prompt tells the model never to follow instructions found inside the document (text such as "ignore previous instructions" is data, and may be reported as a finding). Frame tags inside the document are escaped.
+- **Evidence where verifiable.** Each finding may carry a short verbatim quote. Code checks that the quote appears in the analysed text (after collapsing whitespace; no fuzzy matching, no extra model call). Only then is it shown as a quotation. A finding without a verified quote is kept, and the report says how many findings lack one.
+- **Priority is the model's assessment**, on a high / medium / low scale given in the prompt. It is not a legal classification.
+- **No self-reported confidence score.** A refusal, a response cut off by the token limit, or an off-schema answer is reported as a service failure, never as a verdict on the document. If the model finds nothing, the report says "no findings in the analysed part", not that the document is safe.
+- **Page coverage is stated by code.** When coverage is partial, the model is also told which pages it saw, so it does not conclude that something is missing from pages it never read.
+
+Models and the voice are configured through environment variables ([`.env.example`](.env.example)); the defaults are in [`config.py`](config.py).
+
+## Privacy and data flow
+
+| Data | Processor / storage |
+|---|---|
+| Telegram upload (voice, PDF, image) | Telegram, then downloaded into a temporary local session workspace |
+| Document content and the voice instruction | OpenAI, where processing requires it: speech-to-text, reading scanned pages, analysis, report generation, speech synthesis. Uploaded images are re-encoded as JPEG (EXIF and other metadata dropped) before being sent |
+| Temporary files | An isolated `tgdoc-session-*` directory in the OS temp folder, random name (no user or chat id), neutral file names. Removed on completion, on failure, when a pending file is replaced, on `/start` and on expiry |
+| Generated report, checklist and audio | Built in memory and sent to the same chat; never written to disk |
+| Session state | In memory (aiogram FSM); lost on restart |
+| Logs | Stage names, exception class names, sizes and counts. No document, transcript or model text; bot tokens and API keys are redacted by a filter. `/start` logs the numeric Telegram user id |
+| Persistent database | None |
+
+- No Google or gTTS: speech synthesis goes through OpenAI only.
+- No online legal or registry lookups: the deterministic checks are offline.
+- No permanent document storage.
+- **Abandoned sessions.** A session that never receives its second half expires after `SESSION_TIMEOUT_MINUTES`. The check is lazy: expiry is noticed when the same user writes again, and the files are deleted then. Directories left by a crashed process are purged at the next start, so a session whose user never returns can stay on disk until the bot restarts.
+- Telegram and OpenAI remain external processors under their own terms and retention policies. This project makes no regulatory-compliance claims; do not upload confidential or personal documents.
+
+## Safety and processing limits
+
+Every limit is defined in [`services/limits.py`](services/limits.py), which is authoritative; the table is checked against it by a test.
+
+| What | Limit |
+|---|---|
+| Supported types | PDF, JPG, PNG, WEBP. The type is decided from the file content, not the extension: a PNG renamed `.pdf` is processed as a PNG, a text file named `.pdf` is rejected |
+| Maximum upload size | 20 MB |
+| PDF pages accepted | up to 20 |
+| PDF pages **analysed** | the first 5 |
+| PDF page size | 36 to 3600 pt per side (A4 is 595×842) |
+| Image size | up to 40 megapixels, at least 32 px per side |
+| Voice | size checked locally; format and length are left to the speech-to-text service |
+
+- **Rejected:** empty or corrupt files, encrypted or password-protected PDFs (including owner-password-only), PDFs with implausible page sizes, and decompression-bomb images with a huge declared resolution. Each rejection tells the user why.
+- **Image normalisation.** Images are decoded, EXIF rotation applied, metadata dropped, and re-saved as JPEG with the long side at most 2048 px. The original bytes are never forwarded.
+- **How a PDF is read.** The text layer is read per page. A page with almost no text is treated as a scan: it is rendered by Poppler (long side at most 2048 px, a 20 s timeout per call) and read by the AI vision model. Blocking work (pypdf, Poppler, Pillow) runs off the event loop. Rendering and the paid vision calls happen only after every free local check has passed, and the voice task is transcribed only after the document text was extracted, so a file that fails validation or rendering is rejected before any paid call.
+- **Page coverage is shown in every report**, written by code (in Russian; translated here): `Analysed pages: 1–3 of 3.` or `Only pages 1–5 of 12 were analysed. Pages 6–12 were not included.` Pages with no recognised text and pages whose text was cut at the length limit are listed in the same line.
+- Reports are plain text (no Markdown or HTML mode), at most 4000 characters. Only the model's text is ever shortened. The automatic-checks section and the quotes block have their own caps (failed checks are listed first, and any hidden ones are counted), and the coverage line and the disclaimer are never cut.
+
+## Output example
+
+Everything below is **synthetic**: a fictitious contract ([`docs/demo/sample_contract.pdf`](docs/demo/sample_contract.pdf)), fictitious companies, and identifiers that are valid by checksum but cannot belong to a real entity (INN region code `00`, OGRN starting with `0`). The buyer's INN has a deliberate one-digit typo.
+
+The checks, evidence verification, report composition and checklist are produced by this repository's real code. The **model's** wording is a hand-written stand-in; no OpenAI or Telegram call was made. The sample is regenerated and verified by a test, see [`docs/demo/`](docs/demo/). Excerpt of [`sample_report.txt`](docs/demo/sample_report.txt) (the bot writes in Russian):
+
+```text
+🔎 Автоматические проверки реквизитов (код, без участия ИИ)
+❌ ИНН 0076543216 (стр. 1) — контрольное число не совпадает.
+✅ ИНН 0012345673 (стр. 1) — контрольное число корректно.
+✅ ОГРН 0123456789016 (стр. 1) — контрольное число корректно.
+ℹ️ КПП 000101001 (стр. 1) — формат соответствует ожидаемому; контрольная сумма для КПП не проверяется.
+[…]
+
+Автоматические проверки оценивают только формат и контрольные признаки и не подтверждают существование или статус организации, принадлежность реквизита стороне и юридическую силу документа.
+
+🤖 Предварительный разбор: оценка модели ИИ
+[…]
+• Высокий приоритет. Неустойка предусмотрена только за просрочку оплаты Покупателем; ответственность Поставщика не определена.
+• Средний приоритет. Указанная сумма НДС (20 000,00 руб.) не сходится с ценой при ставке 20%: по расчёту модели получается около 16 666,67 руб.
+• Средний приоритет. Не указан срок поставки.
+[…]
+
+📎 Цитаты из документа (найдены в его тексте дословно):
+• [Высокий] Неустойка предусмотрена только для Покупателя: «За просрочку оплаты Покупатель уплачивает Поставщику неустойку в размере 1% от суммы долга за каждый день просрочки.»
+Для 2 из 3 замечаний нет подтверждающей цитаты из текста документа: это оценка модели.
+
+ℹ️ Проанализированные страницы: 1 из 1.
+
+⚠️ Это автоматический предварительный разбор (first-pass review), а не юридическая консультация. Оценку выполнила модель ИИ: она может ошибаться и не заменяет проверку юристом.
+```
+
+| Block | Written by | Meaning |
+|---|---|---|
+| "Automatic checks (code, no AI)" | code | `❌` the buyer's INN fails its check-digit rule (a typo); `✅` the seller's INN and OGRN satisfy theirs; `ℹ️` KPP has a valid format but no checksum exists. The note below states what this does *not* prove |
+| "Preliminary review: the AI model's assessment" | AI model | findings and priorities as the model sees them; here the model has flagged a one-sided penalty, a VAT sum that does not match the price, and a missing delivery date |
+| "Quotes from the document (found verbatim in its text)" | code | the first finding's quote was found word for word, so it is shown as a quotation. The VAT finding quoted a paraphrase and the delivery-date finding is about something absent, so the report says that 2 of 3 findings have no confirming quote |
+| Coverage line | code | which pages were analysed |
+| Disclaimer | code | always present, never cut |
+
+The PDF checklist for the same run lists only the checks that failed (in a section of its own), then the model's items by priority ([`sample_checklist.pdf`](docs/demo/sample_checklist.pdf)):
+
+![Checklist preview](docs/demo/sample_checklist.png)
+
+## Setup
+
+### Requirements
+
+- **Python 3.12** (3.13 is also tested in CI).
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** for the environment and dependencies.
+- **Poppler**, which renders scanned PDF pages. `pdftoppm` and `pdfinfo` must be on `PATH`. PDFs with a text layer and images work without it; only scanned pages inside a PDF need it.
+- A **Telegram bot token** from [@BotFather](https://t.me/BotFather).
+- An **OpenAI API key**. The bot makes paid API calls.
+
+### Windows (PowerShell)
+
+```powershell
+winget install --id=astral-sh.uv -e
+winget install oschwartz10612.Poppler     # or a build from https://github.com/oschwartz10612/poppler-windows/releases
+# open a new terminal so PATH is refreshed, then check:  uv --version ; pdftoppm -v
+
+git clone https://github.com/eliv1982/telegram-legal-doc-review-assistant.git
+cd telegram-legal-doc-review-assistant
+
+uv sync --locked                          # creates .venv with Python 3.12 and exactly the locked dependencies
+Copy-Item .env.example .env               # then edit .env: set BOT_TOKEN and OPENAI_API_KEY
 uv run python bot.py
 ```
 
-## Тесты и линтер
+### Linux / macOS
 
 ```bash
-uv run pytest          # офлайн: ни Telegram, ни OpenAI не вызываются, ключи не нужны
+sudo apt install poppler-utils            # macOS: brew install poppler
+git clone https://github.com/eliv1982/telegram-legal-doc-review-assistant.git
+cd telegram-legal-doc-review-assistant
+uv sync --locked
+cp .env.example .env                      # then edit .env: set BOT_TOKEN and OPENAI_API_KEY
+uv run python bot.py
+```
+
+`.env` is git-ignored; never commit it. Only `.env.example` is tracked, and it holds placeholders.
+
+### Configuration
+
+| Variable | Purpose |
+|---|---|
+| `BOT_TOKEN`, `OPENAI_API_KEY` | Required |
+| `SESSION_TIMEOUT_MINUTES` | How long an unfinished session waits for its second half |
+| `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES` | Timeout of one OpenAI request, and SDK retries on 429, 5xx and network failures |
+| `OPENAI_TRANSCRIPTION_MODEL`, `OPENAI_TRANSCRIPTION_LANGUAGE` | Speech-to-text |
+| `OPENAI_VISION_MODEL` | Reading scanned pages and photos |
+| `OPENAI_ANALYSIS_MODEL`, `OPENAI_REPORT_MODEL` | Document analysis and report generation |
+| `OPENAI_TTS_MODEL`, `OPENAI_TTS_VOICE` | Voice summary |
+
+Defaults are listed in [`.env.example`](.env.example) and [`config.py`](config.py).
+
+## Tests and CI
+
+```bash
+uv run pytest
 uv run ruff check .
+uv lock --check
 ```
 
-Тесты не читают `.env` и блокируют внешние сетевые соединения. В тестах адаптера и пайплайна ответы OpenAI подставляет скриптовый транспорт под настоящим SDK из `uv.lock` (форма запроса, разбор и классы ошибок — настоящие, сети нет). Подтверждённый, но ещё не исправленный дефект фиксируется как `xfail(strict=True)`: когда тест начинает проходить, прогон падает и пометку нужно снять вместе с исправлением. Сейчас таких тестов нет.
+- The suite is **offline and deterministic**. A network guard makes any attempt to reach an external host fail the test, the suite never reads `.env`, and no real OpenAI or Telegram call is made. Adapter and pipeline tests run the real pinned OpenAI SDK against a scripted transport, so request shapes, parsing and error classes are real while the network is not.
+- **CI** (GitHub Actions) runs on Python **3.12 and 3.13** with the locked dependencies: lockfile check, Ruff, byte-compilation and the full test suite. CI installs Poppler, so the Poppler-dependent tests run there; locally they are skipped if Poppler is missing.
+- The demo in [`docs/demo/`](docs/demo/) is regenerated by a test and compared with the committed files.
 
-## Использование
+## Project structure
 
-1. Отправьте боту **голосовое сообщение** с задачей (например: «Проверь этот договор на риски»).
-2. Отправьте **документ** — PDF или изображение (JPG, PNG, WEBP).
-3. Порядок не важен — бот объединит голос и документ и вернёт результат.
-
-## Загрузка файлов и охват анализа
-
-Каждый файл проверяется локально и бесплатно **до любых платных вызовов OpenAI**. Если документ не принят, бот сразу говорит почему (без «попробуйте позже»: дело в самом файле), а уже присланный голос остаётся в сессии — достаточно отправить другой документ. Порядок обработки: проверка → извлечение текста документа → автоматические проверки реквизитов (локальный код) → транскрибация голоса → анализ → отчёт, поэтому за транскрибацию задачи к непригодному документу платить не приходится.
-
-Тип определяется **по содержимому, а не по расширению**: изображение реально декодируется (Pillow), PDF проходит структурную проверку (pypdf). PNG, переименованный в `.pdf`, обрабатывается как PNG, текстовый файл с расширением `.pdf` отклоняется.
-
-| Что | Лимит |
-|-----|-------|
-| Форматы | PDF, JPG, PNG, WEBP |
-| Размер файла | до 20 МБ |
-| Страниц в PDF (принимается) | до 20 |
-| Страниц, которые **анализируются** | первые 5 |
-| Размер страницы PDF | от 36 до 3600 pt по каждой стороне (A4 = 595×842) |
-| Изображение | до 40 Мпикс, не меньше 32 px по стороне |
-
-Не принимаются: пустые и повреждённые файлы, PDF с шифрованием или паролем (в том числе с запретом редактирования), PDF с нереальными размерами страниц, изображения-«бомбы» с огромным заявленным разрешением. Значения лимитов собраны в [`services/limits.py`](services/limits.py).
-
-**Как читается PDF.** Сначала берётся текстовый слой, постранично (рендеринг не нужен). Страница, где текста практически нет, считается сканом: она рендерится Poppler-ом (длинная сторона не больше 2048 px, тайм-аут 20 с на вызов) и распознаётся vision-моделью. Читаются только первые 5 страниц; остальные не анализируются, и бот об этом сообщает. Блокирующая работа (pypdf, Poppler, Pillow) вынесена из event loop в потоки; разбор самим pypdf по времени не ограничен — его ограничивают размер файла и число страниц.
-
-**Изображения** перед отправкой в vision-модель пересохраняются как JPEG: поворот из EXIF применяется, метаданные удаляются, длинная сторона не больше 2048 px. Исходные байты файла дальше не передаются.
-
-**Охват в отчёте.** Строку охвата формирует код, а не модель, и дописывает её после текста модели (перед дисклеймером), например:
-
-- `ℹ️ Проанализировано: загруженное изображение.`
-- `ℹ️ Проанализированные страницы: 1–3 из 3.`
-- `ℹ️ Проанализированы только страницы 1–5 из 12. Страницы 6–12 в анализ не вошли.`
-
-Страницы без распознанного текста (пустые или нечитаемые) и страницы с текстом, сокращённым по лимиту длины, перечисляются в этой же строке. Модели при неполном охвате тоже сообщается, какие страницы она видела.
-
-## Автоматические проверки реквизитов
-
-В отчёте есть отдельный раздел, который пишет **код, а не модель**: в извлечённом тексте документа он находит реквизиты **с метками** и проверяет их формат и, где правило известно, контрольное число. Раздел не использует ответы модели (даже её «ключевые факты»), не обращается в сеть и не вызывает ИИ; модель его результатов не видит и переписать их не может. Если реквизитов с метками в проанализированной части не найдено, раздела нет. Порядок сообщения: автоматические проверки → оценка модели → цитаты → строка охвата → дисклеймер; всё, что добавляет код, не вытесняется при сокращении текста модели, лимит 4000 знаков соблюдается.
-
-```
-🔎 Автоматические проверки реквизитов (код, без участия ИИ)
-❌ ИНН 7707083894 (стр. 2) — контрольное число не совпадает.
-✅ ИНН 7707083893 (стр. 1) — контрольное число корректно.
-ℹ️ КПП 773601001 (стр. 1) — формат соответствует ожидаемому; контрольная сумма для КПП не проверяется.
-
-Автоматические проверки оценивают только формат и контрольные признаки и не подтверждают существование или статус организации, принадлежность реквизита стороне и юридическую силу документа.
+```text
+bot.py                      entry point: aiogram dispatcher, long polling
+config.py                   environment configuration
+handlers/                   session pairing, the pipeline, delivery, /start
+services/
+  validation.py             content-sniffed types, size and page limits
+  pdf_converter.py          page text layer, bounded Poppler rendering
+  document_extraction.py    page-coverage policy
+  requisites.py             labelled requisite extraction
+  deterministic_checks.py   INN / KPP / OGRN / OGRNIP / BIK / account rules
+  openai_service.py         OpenAI adapter (structured parsing)
+  schemas.py                Pydantic models for model output
+  grounding.py              evidence verification
+  report.py                 what code adds around the model's text
+  checklist_generator.py    PDF checklist
+  tts_service.py            OpenAI text-to-speech
+  workspace.py              per-session temporary directories
+  limits.py                 every processing limit in one place
+prompts/                    prompt assembly (fenced, untrusted-data framing)
+assets/fonts/               bundled PT Sans (SIL OFL 1.1)
+docs/demo/                  synthetic sample document, outputs, generator
+tests/                      offline test suite
 ```
 
-| Реквизит | Правило | Вид проверки | Источник |
-|----------|---------|--------------|----------|
-| ИНН, 10 цифр | только цифры, длина, контрольное число (10-я цифра) | контрольное число | приказ ФНС России от 26.06.2025 № ЕД-7-14/559@ (зарегистрирован Минюстом России 08.10.2025 № 83789, в силе с 01.01.2026): структура и длины; контрольное число — «по алгоритму, определённому ФНС» |
-| ИНН, 12 цифр | то же, два контрольных числа (11-я и 12-я цифры) | контрольное число | там же |
-| КПП | 9 знаков: 4 цифры, 2 знака (цифра или заглавная латинская буква), 3 цифры | **только формат**: у КПП нет контрольного числа, и оно не выдумывается | там же |
-| ОГРН | 13 цифр; 13-я цифра — младший разряд остатка от деления первых 12 на 11 | контрольное число | приказ Минфина России от 30.10.2017 № 165н (ред. от 19.12.2022), п. 7 |
-| ОГРНИП | 15 цифр; 15-я цифра — младший разряд остатка от деления первых 14 на 13 | контрольное число | там же |
-| БИК | 9 цифр, первая — 0, 1 или 2, остальные не «00000000» | **только формат** | Положение Банка России от 24.09.2020 № 732-П, приложение 5, п. 3 (ред. от 17.06.2025) |
-| р/с, к/с | 20 знаков | **только длина** | Положение Банка России от 24.11.2022 № 809-П, приложение 1 к Плану счетов |
+## Design decisions and non-goals
 
-Алгоритм контрольного числа ИНН (коэффициенты) в приказе ФНС не приведён. Он взят из описания алгоритма на портале [info.gosuslugi.ru](https://info.gosuslugi.ru/articles/%D0%92%D0%B0%D0%BB%D0%B8%D0%B4%D0%B0%D1%86%D0%B8%D1%8F/) и проверен на ИНН и ОГРН двенадцати известных организаций (все совпали); ФНС подтверждает, что [методика расчёта контрольного числа не меняется](https://www.nalog.gov.ru/rn77/news/activities_fts/16575267/) (публикация от 07.11.2025). Первоисточники читаются при разработке; во время работы бот к ним не обращается.
+- **No database.** A session is one short interaction; nothing needs to outlive it, and storing nothing is a privacy property. Session state is in memory.
+- **No RAG, no legal database.** The project claims only format and checksum validity of requisites plus a model's reading of the text it was given. Retrieval from a legal corpus would imply an authority this project neither has nor verifies.
+- **No public live demo.** A hosted instance would forward strangers' documents to third-party processors under the author's API key. The repository runs locally, and [`docs/demo/`](docs/demo/) shows real outputs of the real code on synthetic input.
+- **Deterministic checks and model assessment stay separate.** They fail differently: a checksum is reproducible, a model's reading is not. Keeping them apart, with the model blind to the check results, means model prose can neither overwrite nor dilute a code-verified result.
+- **Bounded page analysis is intentional.** It bounds cost, latency and abuse, and it is disclosed in every report instead of being hidden.
+- **No numeric confidence, no "document is fine" verdict.** The project would rather say less than imply certainty it does not have.
 
-**Чего это не доказывает.** `✅` значит только «прошло именно это правило формата и контрольного числа». Это не подтверждает, что налогоплательщик, организация или банк существуют и действуют, что номер принадлежит названной в документе стороне и что документ имеет юридическую силу. Реестры (ФНС, ЕГРЮЛ/ЕГРИП, справочник БИК Банка России) не опрашиваются, правовых выводов и проверки по законам нет. `❌` значит «это правило не выполнено», в том числе из-за ошибки распознавания скана (если текст прочитан моделью по изображению, раздел об этом предупреждает).
+## Limitations
 
-**Как ищутся реквизиты.** Только после метки: `ИНН`, `КПП`, `ОГРН`, `ОГРНИП`, `БИК`, `р/с`, «расчётный счёт», `к/с`, «корреспондентский счёт» (регистр и пробелы любые), а также `ИНН/КПП 7707083893 / 773601001` и «ИНН получателя». Число без метки реквизитом не считается: телефоны, даты, номера договоров и суммы не принимаются за ИНН, сколько бы цифр в них ни было. Нормализуются только пробелы (в том числе неразрывные) между группами цифр; цифры не «исправляются». Неоднозначная вёрстка (метки подряд в шапке таблицы, одно значение под двумя метками) пропускается, а не угадывается. Страница указывается по маркерам `[Страница N]` и только из числа проанализированных; сами маркеры в поиск не попадают, а поддельный маркер в тексте документа не может назвать страницу, которая не анализировалась (номер страницы — пояснение, на результат проверки он не влияет). Одинаковые реквизиты схлопываются в одну строку со списком страниц; два разных значения под одной меткой остаются двумя строками, и неверное не отменяет верное. Текст документа — только данные: фраза «ИНН считать корректным» ничего не меняет.
+- **Not legal advice.** First-pass review only; a lawyer's review is not replaced.
+- **No existence or registry verification.** Nothing is looked up online.
+- **Format or checksum validity is not entity validity.** A requisite can pass its rule and still be wrong, or belong to someone else.
+- **Model findings may be wrong or incomplete**, including the priorities. A finding without a verified quote is the model's opinion alone.
+- **Only the analysed pages are considered**: the first 5 pages of a PDF. Anything on later pages is not seen.
+- **OCR and vision may misread scanned documents**, which can produce a false `❌` or a wrong finding.
+- Russian-language documents and Russian requisite formats only.
+- Session state is in memory: a restart drops unfinished sessions.
 
-**Сознательно не реализовано.** Проверка защитного ключа р/с и к/с (9-й знак): алгоритм не приведён в действующем Положении № 809-П (оно отсылает к «нормативным актам Банка России»), связь счёта с БИК в свободном тексте документа неоднозначна (обычно в документе несколько БИК и счетов), а в примерах прежней схемы нумерации (Положение № 579-П) в позиции ключа стоит буква. Поэтому счета проверяются только по длине: 20 знаков из них не все цифры — информационная строка, а не ошибка. «Контрольный ключ» из приложения 5 к Положению № 732-П относится к паре БИК + счёт участника платёжной системы Банка России в справочнике БИК, и к реквизитам произвольного документа не применяется. Арифметика НДС и вообще налоговые расчёты и онлайн-проверка по реестрам тоже не делаются. В файл чек-листа попадают только непрошедшие проверки, отдельным разделом (см. «Отчёт, голос и чек-лист»).
+## License
 
-## Отчёт, голос и чек-лист
+[MIT](LICENSE). The bundled PT Sans font is © ParaType, under the [SIL Open Font License 1.1](assets/fonts/OFL.txt); its source and checksums are in [`assets/fonts/README.md`](assets/fonts/README.md).
 
-**Порядок и сбои.** Основной результат — текстовый отчёт: он отправляется первым. Голосовое резюме и PDF-чек-лист создаются и отправляются после него, каждый сам по себе, и необязательны:
+## Кратко по-русски
 
-| Шаг | Если не удался |
-|-----|----------------|
-| 1. Текстовый отчёт | пользователь получает «Произошла ошибка при обработке…», голос и чек-лист не пытаются |
-| 2. Голосовое резюме | одно сообщение «Не удалось создать голосовое резюме; текстовый отчёт доступен выше.»; чек-лист всё равно отправляется |
-| 3. PDF-чек-лист | одно сообщение «Не удалось создать PDF-чеклист; основной отчёт уже сформирован.»; отчёт и голос остаются |
+**telegram-legal-doc-review-assistant** — учебный портфолио-проект: Telegram-бот для предварительного разбора (first-pass review) российских деловых документов. Он **не даёт юридических заключений**.
 
-Сбой любого файла (синтез речи, построение PDF, отправка в Telegram, даже самого сообщения о сбое или обновления статуса «Обрабатываю…») не превращается в ошибку запроса. Текст ошибки провайдера или Telegram пользователю и в журнал не попадает: в журнале этап и класс исключения. Рабочая папка сессии удаляется в любом случае.
+1. Отправьте боту документ (PDF, JPG, PNG, WEBP) и голосовое сообщение с задачей, например: «Проверь этот договор на риски». Порядок любой.
+2. Код проверяет файл и извлекает текст, затем **автоматически проверяет реквизиты** (ИНН, КПП, ОГРН/ОГРНИП, БИК, счета) только по формату и контрольным числам. Существование организации и принадлежность реквизита не проверяются, реестры не опрашиваются.
+3. Модель ИИ делает предварительный разбор по структурной схеме; цитаты в замечаниях проверяются кодом по тексту документа. Приоритеты — оценка модели, а не юридическая классификация.
+4. В ответ приходят текстовый отчёт (отчёт всегда первым, с указанием проанализированных страниц), голосовое резюме и PDF-чек-лист.
 
-**Формат сообщений.** Все сообщения бота — обычный текст, режим разметки Telegram (Markdown/HTML) не включён. Подчёркивания, звёздочки, скобки, `<`, `&`, адреса, кириллица и эмодзи в тексте модели, цитатах и значениях реквизитов уходят как есть: экранировать нечего, а создать форматирование или скрытую ссылку из такого текста нельзя. Превью ссылок выключено. Telegram может сам подсветить голый адрес, но ведёт он ровно туда, что написано. Промпт просит модель писать без Markdown/HTML.
-
-**Длина сообщения.** Лимит отчёта — 4000 знаков. Не сокращаются и не теряются: раздел автоматических проверок (у него свой потолок), цитаты (свой потолок), строка охвата и дисклеймер. Сокращается только текст модели: по границе абзаца, иначе строки, предложения, слова; слово пополам режется, лишь если оно одно длиннее всего лимита. В конце сокращённого текста стоит пометка «сокращено по лимиту сообщения Telegram».
-
-**PDF-чек-лист.** Строится только из структурных данных, текст не разбирается обратно. В нём два раздела:
-
-1. «Автоматические проверки реквизитов: не пройдены» — только непрошедшие (`❌`) проверки. Строку пишет код (та же формулировка, что в отчёте), модель её не пересказывает и не переписывает. Пройденные (`✅`) и информационные (`ℹ️`) проверки в чек-лист не попадают; если непрошедших нет, раздела нет. Под заголовком — пометка, что проверки сделал код без ИИ и что они не подтверждают существование и статус организации (и о возможной ошибке распознавания скана).
-2. «Чек-лист модели (предварительная оценка ИИ)» — пункты модели в порядке приоритета (высокий, средний, низкий); приоритет — видимая метка `[Высокий]` / `[Средний]` / `[Низкий]` в тексте пункта.
-
-Заголовки разделов — заголовки, а не пункты: квадрата для отметки у них нет. Длинный пункт переносится по словам и по страницам, а не обрезается; слово шире страницы переносится по символам. Только PDF: PNG-вариант и переменная `CHECKLIST_FORMAT` удалены (значение в `.env` игнорируется). Под заголовком файла стоит пометка о предварительной оценке (файл может уйти дальше без отчёта).
-
-*Шрифт.* PDF рисуется шрифтом **PT Sans** (Regular и Bold, лицензия SIL OFL 1.1), который лежит в репозитории: [`assets/fonts/`](assets/fonts/) (лицензия, источник и контрольные суммы — в `assets/fonts/README.md`). Системные шрифты не нужны, кириллица не зависит от машины, а при одинаковом входе PDF получается одинаковым. Квадрат отметки нарисован фигурой: в шрифте нет символа «☐». Символ, которого в шрифте нет (эмодзи, редкие значки), заменяется на `?`, а не превращается в пустой квадрат. Если файл шрифта недоступен, построение PDF завершается явной ошибкой (без подмены шрифтом без кириллицы), и пользователь получает сообщение о чек-листе.
-
-**Голосовое резюме.** Бюджет один: **150 слов** (`limits.TTS_MAX_WORDS`). Промпт просит не больше и ставит самое важное вперёд (что за документ → главное замечание → рекомендация → условия), а код при превышении оставляет целые предложения и никогда не режет слово. Код дописывает две короткие фразы, в бюджет они не входят: «Автоматические проверки реквизитов выявили замечания.» (только если какая-то проверка не прошла; сами проверки вслух не читаются, выводов код не делает) и «Это предварительная оценка модели, а не юридическая консультация.».
-
-## Ответы модели: структура и цитаты
-
-Анализ и отчёт запрашиваются через `chat.completions.parse` с моделями Pydantic ([`services/schemas.py`](services/schemas.py)): API возвращает JSON по схеме, SDK его проверяет, дальше код работает с типизированными объектами. Разбора свободного текста и «спасения» JSON регулярками нет.
-
-- **Анализ:** тип документа, суть, ключевые данные и замечания. У замечания есть приоритет `high` / `medium` / `low` — это оценка модели, а не юридическая классификация, — название, описание и цитата `evidence` (или `null`).
-- **Отчёт:** текст отчёта, текст голосового резюме и пункты чек-листа (приоритет + действие) приходят отдельными полями. Разделов, склеенных маркерами в одном тексте, нет, поэтому подделать их содержимым документа нельзя.
-- **Числовой «уверенности» модели нет.** Успех извлечения текста определяет только детерминированный слой (см. выше), а не самооценка модели. Если замечаний нет, так и сказано («в проанализированной части замечаний не выявлено»), без вывода, что документ безопасен.
-- **Текст документа — данные, а не инструкции.** В промптах задача пользователя и документ передаются в отдельных тегах `<user_task>` и `<document>`; модель получает прямой запрет выполнять указания из документа, а теги рамки внутри документа экранируются.
-- **Цитаты проверяются кодом.** Цитата замечания показывается как цитата только если после схлопывания пробелов она дословно входит в извлечённый текст документа (без нечёткого сравнения и дополнительных вызовов модели). Остальные замечания остаются, но без цитаты, и отчёт об этом сообщает. Это не проверка по законам или иным источникам.
-- **Отказ модели, обрыв ответа по лимиту токенов и ответ не по схеме** — сбои сервиса с отдельными сообщениями пользователю, а не «плохое качество документа». Так же различаются ошибка ключа или настройки, лимит запросов/недоступность и тайм-аут. Текст ошибок провайдера пользователю и в логи не попадает.
-- **Клиент OpenAI** один на процесс: создаётся при запуске с явными тайм-аутом и числом повторов, общий для всех вызовов, закрывается при остановке бота.
-
-## Временные файлы и сессии
-
-- Первый файл (голос или документ) открывает сессию: для неё создаётся отдельная временная папка `tgdoc-session-*` со случайным именем (`tempfile.mkdtemp`, без user/chat id). Внутри файлы с нейтральными именами (`voice.ogg`, `document.pdf`).
-- Папка удаляется целиком, когда сессия закончилась: после обработки (успешной или с ошибкой), при замене ожидающего файла новым и по `/start`.
-- Незавершённая сессия (пришла только одна половина) истекает через `SESSION_TIMEOUT_MINUTES` минут. Проверка ленивая: истечение замечается, когда от того же пользователя приходит следующее сообщение; тогда файлы удаляются, а бот сообщает, что прежняя сессия истекла. Если пользователь больше ничего не пришлёт, файлы остаются на диске до перезапуска бота: при запуске удаляются папки `tgdoc-session-*` старше таймаута, оставшиеся от прежнего процесса.
-- События одного пользователя обрабатываются по очереди (`SimpleEventIsolation` из aiogram), разные пользователи друг друга не блокируют. Состояние сессий хранится в памяти процесса и теряется при перезапуске.
-- В логи попадают этапы, классы исключений и размеры, но не текст голоса, документа или ответов модели, не URL и не токены. Дополнительно включён фильтр, маскирующий токены бота и ключи OpenAI.
-
-## Переменные окружения
-
-| Переменная | Описание |
-|------------|----------|
-| `BOT_TOKEN` | Токен бота (BotFather) |
-| `OPENAI_API_KEY` | Ключ OpenAI API |
-| `SESSION_TIMEOUT_MINUTES` | Через сколько минут сбрасывается незавершённая сессия (по умолчанию 10) |
-| `OPENAI_TIMEOUT_SECONDS` | Тайм-аут одного запроса к OpenAI, секунды (по умолчанию 90) |
-| `OPENAI_MAX_RETRIES` | Повторы при 429, 5xx и сетевых сбоях, делает сам SDK (по умолчанию 2) |
-| `OPENAI_TRANSCRIPTION_MODEL`, `OPENAI_TRANSCRIPTION_LANGUAGE` | Распознавание речи (по умолчанию `whisper-1`, `ru`) |
-| `OPENAI_VISION_MODEL` | Распознавание страниц-сканов и фото (по умолчанию `gpt-4o`) |
-| `OPENAI_ANALYSIS_MODEL`, `OPENAI_REPORT_MODEL` | Анализ и отчёт (по умолчанию `gpt-4o`, `gpt-4o-mini`) |
-| `OPENAI_TTS_MODEL`, `OPENAI_TTS_VOICE` | Голосовое резюме (по умолчанию `tts-1`, `alloy`) |
-
-## Лицензия
-
-MIT
+Документ и голос передаются в Telegram и OpenAI — не загружайте конфиденциальные документы. Установка и запуск описаны выше в разделе [Setup](#setup); пример вывода на вымышленных данных — в разделе [Output example](#output-example).

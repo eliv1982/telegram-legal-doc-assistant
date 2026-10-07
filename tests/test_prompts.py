@@ -1,5 +1,5 @@
 """
-Prompt assembly (Stage 4): the user task and the document are separate, fenced blocks of DATA, whatever the document
+Prompt assembly: the user task and the document are separate, fenced blocks of DATA, whatever the document
 says; the system prompts frame the output as a model assessment (first-pass review), not a verified verdict.
 """
 import re

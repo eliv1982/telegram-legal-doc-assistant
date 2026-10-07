@@ -728,7 +728,7 @@ wheels = [
 ]
 
 [[package]]
-name = "telegram-legal-doc-assistant"
+name = "telegram-legal-doc-review-assistant"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

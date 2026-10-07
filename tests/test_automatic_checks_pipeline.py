@@ -1,5 +1,5 @@
 """
-Automatic checks inside the pipeline (Stage 5): they run on the extracted document text only, after extraction and
+Automatic checks inside the pipeline: they run on the extracted document text only, after extraction and
 before anything is paid for, and the model's assessment neither feeds them nor depends on them. Offline: fakes only.
 """
 from services import pdf_converter

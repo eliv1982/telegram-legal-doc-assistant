@@ -1,5 +1,5 @@
 """
-Ingestion through the handlers and the pipeline (Stage 3): invalid input fails locally and for free, in either
+Ingestion through the handlers and the pipeline: invalid input fails locally and for free, in either
 upload order; valid input proceeds in the order validate -> extract -> transcribe -> analyse; every successful
 report carries a coverage line written by code. Offline: OpenAI and Telegram are fakes (or the real SDK on a
 scripted transport), Poppler is stubbed except where a test says otherwise.

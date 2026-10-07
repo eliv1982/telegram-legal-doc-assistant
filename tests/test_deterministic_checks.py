@@ -1,5 +1,5 @@
 """
-Deterministic requisite checks (Stage 5): what each validator proves, and the properties that keep the layer honest:
+Deterministic requisite checks: what each validator proves, and the properties that keep the layer honest:
 it reads the document text only, is the same on every call, cannot be talked out of a verdict by the document,
 and never claims more than a format / check-digit rule can.
 

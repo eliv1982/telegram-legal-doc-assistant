@@ -1,5 +1,5 @@
 """
-Upload validation (Stage 3): the type comes from the content, never from the extension, and every
+Upload validation: the type comes from the content, never from the extension, and every
 permanent input problem is a typed Rejection decided locally before any paid call.
 """
 import io

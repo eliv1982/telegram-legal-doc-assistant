@@ -1,10 +1,10 @@
 """
-Regression ledger: the confidence-semantics defect (confirmed in Stage 1, fixed in Stage 4).
+Regression ledger: the confidence-semantics defect (fixed).
 
 The model used to rate its own OCR quality as a number and the pipeline gated on it: a missing or garbage value became
 100, `0.95` became 0, and a model that answered in prose was reported as "the document quality is low". The four
 strict xfails that recorded this are now passing tests of the new semantics: the number is gone, extraction success is
-decided by the deterministic Stage 3 layer, and a model/format failure is a service outcome, never a verdict on the file.
+decided by the deterministic extraction layer, and a model/format failure is a service outcome, never a verdict on the file.
 """
 import re
 from pathlib import Path

@@ -21,7 +21,7 @@ SESSION_TIMEOUT_MINUTES = int(getenv("SESSION_TIMEOUT_MINUTES", "10"))
 OPENAI_TIMEOUT_SECONDS = float(getenv("OPENAI_TIMEOUT_SECONDS", "90"))
 OPENAI_MAX_RETRIES = int(getenv("OPENAI_MAX_RETRIES", "2"))
 
-# Модели и голос. Значения по умолчанию совпадают с теми, что раньше были зашиты в коде.
+# Модели и голос. Значения по умолчанию можно переопределить в .env.
 OPENAI_TRANSCRIPTION_MODEL = getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1")
 OPENAI_TRANSCRIPTION_LANGUAGE = getenv("OPENAI_TRANSCRIPTION_LANGUAGE", "ru")
 OPENAI_VISION_MODEL = getenv("OPENAI_VISION_MODEL", "gpt-4o")  # распознавание страниц-сканов и фото

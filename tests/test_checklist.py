@@ -1,5 +1,5 @@
 """
-services/checklist_generator.py (Stage 6): structured items and the failed automatic checks go in, one readable PDF
+services/checklist_generator.py: structured items and the failed automatic checks go in, one readable PDF
 comes out. PDFs are generated offline and read back with pypdf; there are no pixel comparisons.
 """
 import inspect

@@ -9,7 +9,6 @@ import pytest
 MODULES = [
     "bot",
     "config",
-    "handlers.callbacks",
     "handlers.document",
     "handlers.start",
     "prompts.analysis_prompt",

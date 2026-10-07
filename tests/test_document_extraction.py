@@ -1,5 +1,5 @@
 """
-Coverage policy (Stage 3): text layer first and page by page, Vision only for pages without text, an explicit
+Coverage policy: text layer first and page by page, Vision only for pages without text, an explicit
 page budget, and a result that says exactly which pages were analysed. Offline: Vision is a recording fake and,
 unless a test says otherwise, so is the Poppler renderer.
 """

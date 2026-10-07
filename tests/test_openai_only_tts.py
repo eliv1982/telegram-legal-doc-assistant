@@ -1,5 +1,5 @@
 """
-TTS is OpenAI-only (Stage 2): the gTTS / Google Translate data path is gone, not merely switched off.
+TTS is OpenAI-only: the gTTS / Google Translate data path is gone, not merely switched off.
 """
 import importlib
 import inspect

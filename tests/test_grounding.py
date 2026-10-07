@@ -1,5 +1,5 @@
 """
-Grounding (Stage 4): a model finding is tied to the extracted document by a deterministic check, and nothing the model
+Grounding: a model finding is tied to the extracted document by a deterministic check, and nothing the model
 invents can reach the user as a source quote or move a report section. This is NOT legal-source verification.
 """
 from services.grounding import MAX_EVIDENCE_CHARS, MIN_EVIDENCE_CHARS, ground_issues

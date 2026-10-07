@@ -1,5 +1,5 @@
 """
-Logging privacy (Stage 2): normal logs carry stages, classes and sizes, never transcript/document text,
+Logging privacy: normal logs carry stages, classes and sizes, never transcript/document text,
 and a redaction filter masks bot tokens / API keys as a second line of defence.
 """
 import io

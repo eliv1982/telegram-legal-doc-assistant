@@ -1,5 +1,5 @@
 """
-The OpenAI adapter (Stage 4) on the REAL pinned SDK with a scripted transport: what goes on the wire, what comes back
+The OpenAI adapter on the REAL pinned SDK with a scripted transport: what goes on the wire, what comes back
 typed, and how every failure becomes one of a few service outcomes instead of a verdict on the document. No socket is opened.
 """
 import json

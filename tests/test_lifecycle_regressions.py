@@ -1,5 +1,5 @@
 """
-Regression ledger: temp-file lifecycle defect (fixed in Stage 2), plus a passing control.
+Regression ledger: temp-file lifecycle defect (fixed), plus a passing control.
 
 The control shows the leftover-file check and the whole fake pipeline work; the second test is the one
 ordering where an input file used to be left behind (it was a strict xfail until the session workspace

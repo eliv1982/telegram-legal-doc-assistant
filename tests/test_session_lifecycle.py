@@ -1,5 +1,5 @@
 """
-Session lifecycle (Stage 2): every interaction owns exactly one workspace, and replacement, /start, expiry
+Session lifecycle: every interaction owns exactly one workspace, and replacement, /start, expiry
 and every failure path remove it. Offline: handlers run against fakes, workspaces live under the per-test dir.
 """
 import logging

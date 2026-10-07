@@ -1,5 +1,5 @@
 """
-utils/text.py (Stage 6): text is shortened at a paragraph, line, sentence or word boundary, never by a character count
+utils/text.py: text is shortened at a paragraph, line, sentence or word boundary, never by a character count
 that lands in the middle of a word.
 """
 from utils.text import fit_text, fit_words, split_sentences

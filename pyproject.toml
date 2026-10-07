@@ -1,7 +1,7 @@
 [project]
-name = "telegram-legal-doc-assistant"
+name = "telegram-legal-doc-review-assistant"
 version = "0.1.0"
-description = "Telegram bot: voice task + document (PDF/photo) -> text report, voice summary and checklist"
+description = "Telegram first-pass reviewer for Russian business documents: deterministic requisite checks plus structured, evidence-grounded AI assessment"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -48,5 +48,5 @@ target-version = "py312"
 extend-exclude = [".venv"]
 
 [tool.ruff.lint]
-# Ruff defaults (pyflakes F + the pycodestyle E4/E7/E9 subset). Nothing broader on purpose in Stage 1.
+# Ruff defaults (pyflakes F + the pycodestyle E4/E7/E9 subset). Nothing broader on purpose.
 select = ["E4", "E7", "E9", "F"]

@@ -2,3 +2,7 @@
 # (no line-ending conversion, and no whitespace checks: the licence text has trailing spaces).
 assets/fonts/*.ttf binary
 assets/fonts/OFL.txt -text -whitespace
+
+# demo assets (binary; the text samples keep normal line-ending handling)
+docs/demo/*.pdf binary
+docs/demo/*.png binary

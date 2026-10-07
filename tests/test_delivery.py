@@ -1,5 +1,5 @@
 """
-Delivery (Stage 6): the text report is the primary deliverable and goes out first; the voice summary and the PDF
+Delivery: the text report is the primary deliverable and goes out first; the voice summary and the PDF
 checklist come after it and are optional, each on its own. Offline: Telegram and OpenAI are fakes, the PDF renderer is real.
 """
 import io

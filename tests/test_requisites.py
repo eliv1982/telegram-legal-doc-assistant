@@ -1,5 +1,5 @@
 """
-Labelled requisite extraction (Stage 5): only values that follow a label are found, from the document text alone,
+Labelled requisite extraction: only values that follow a label are found, from the document text alone,
 with the analysed page they were found on. Ambiguity is a miss, never a guess.
 
 The identifiers below are public ones (well-known organisations and documentation examples), not personal data.

@@ -1,5 +1,5 @@
 """
-Report composition (Stage 4, plain text since Stage 6): what code adds around the model's text, that none of it can be
+Report composition (plain text): what code adds around the model's text, that none of it can be
 shortened away, and how the spoken summary is bounded.
 """
 from services import limits
