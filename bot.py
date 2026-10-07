@@ -8,7 +8,6 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 
 import config
@@ -34,6 +33,16 @@ def build_dispatcher(ai: AIServices) -> Dispatcher:
     return dp
 
 
+def create_bot(token: str) -> Bot:
+    """
+    Все сообщения бота — обычный текст: режим разметки (Markdown/HTML) не включён нигде, поэтому текст модели и документа
+    нельзя ни «сломать» подчёркиваниями, скобками и тегами, ни заставить создать ссылку или форматирование. Превью
+    ссылок выключено: адрес в тексте модели не подгрузит карточку сайта. Сам Telegram может подсветить голый адрес как
+    ссылку, но она ведёт ровно туда, что написано.
+    """
+    return Bot(token=token, default=DefaultBotProperties(link_preview_is_disabled=True))
+
+
 async def main() -> None:
     setup_logging(log_level="INFO")
     if not config.BOT_TOKEN:
@@ -49,10 +58,7 @@ async def main() -> None:
     if removed:
         logger.info("Удалено устаревших рабочих директорий прошлого запуска: %d", removed)
 
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
-    )
+    bot = create_bot(config.BOT_TOKEN)
     # Один клиент OpenAI на процесс: свои тайм-аут и число повторов, закрывается при остановке.
     openai_client = create_openai_client(config.OPENAI_API_KEY)
     dp = build_dispatcher(AIServices.around(openai_client))

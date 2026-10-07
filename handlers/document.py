@@ -8,8 +8,6 @@ from contextlib import suppress
 from pathlib import Path
 
 from aiogram import Bot, F, Router
-
-import config
 from aiogram.types import BufferedInputFile, Message
 from aiogram.fsm.context import FSMContext
 
@@ -24,13 +22,14 @@ from states.user_states import (
 from services import limits
 from services.ai_errors import AIFailure, AIServiceError
 from services.checklist_generator import generate_checklist
-from services.deterministic_checks import CheckStatus, run_deterministic_checks
+from services.deterministic_checks import CheckStatus, DeterministicCheck, run_deterministic_checks
 from services.document_extraction import METHOD_VISION, DocumentExtractionResult, extract_document, format_coverage
 from services.grounding import ground_issues
 from services.openai_client import AIServices
 from services.openai_service import OpenAIService
 from services.report import compose_report, compose_tts_script, format_automatic_checks
-from services.tts_service import TTS_INPUT_LIMIT, TTSService
+from services.schemas import ChecklistItem, ReportResult
+from services.tts_service import TTSService
 from services.validation import (
     Rejection,
     ValidatedDocument,
@@ -50,8 +49,15 @@ ALLOWED_DOC_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 MIME_TO_EXT = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
 REPORT_CHAR_LIMIT = 4000  # с запасом до лимита Telegram в 4096; строка охвата и дисклеймер в него входят
-# Файл чек-листа живёт отдельно от отчёта и может уйти дальше сам по себе, поэтому пометка об оценке модели — в подписи.
-CHECKLIST_CAPTION = "📋 Чек-лист (предварительная оценка модели, не юридическая консультация)"
+# Файл чек-листа живёт отдельно от отчёта и может уйти дальше сам по себе, поэтому пометка о том, что это оценка
+# модели (и результат кода), — в подписи, а в самом файле — под заголовком.
+CHECKLIST_CAPTION = "📋 Чек-лист: автоматические проверки и предварительная оценка модели (не юридическая консультация)"
+
+STATUS_PROCESSING = "⏳ Обрабатываю…"
+STATUS_ARTIFACTS = "🎧 Отчёт отправлен. Готовлю голосовое резюме и чек-лист…"
+# Необязательные файлы: их сбой не отменяет отчёт. Одно короткое сообщение на файл, без текста ошибки провайдера.
+VOICE_FAILED_MSG = "Не удалось создать голосовое резюме; текстовый отчёт доступен выше."
+CHECKLIST_FAILED_MSG = "Не удалось создать PDF-чеклист; основной отчёт уже сформирован."
 
 ERROR_MSG = "Произошла ошибка при обработке. Попробуйте позже."
 DOWNLOAD_ERROR_MSG = "Не удалось получить файл из Telegram. Отправьте его ещё раз."
@@ -119,17 +125,20 @@ async def run_pipeline(
     doc_path: Path,
     openai_service: OpenAIService,
     tts_service: TTSService,
-    checklist_format: str,
 ) -> None:
     """
     Полный пайплайн: проверка файлов → извлечение документа → автоматические проверки реквизитов → транскрибация →
-    анализ → пост-обработка → TTS → чек-лист → отправка. Проверка и извлечение идут до Whisper, поэтому за
-    транскрибацию задачи к непригодному документу платить не приходится; сама проверка бесплатна и локальна.
+    анализ → пост-обработка → ОТЧЁТ → голосовое резюме → PDF-чек-лист. Проверка и извлечение идут до Whisper, поэтому
+    за транскрибацию задачи к непригодному документу платить не приходится; сама проверка бесплатна и локальна.
     Автоматические проверки — тоже бесплатный локальный код по тексту документа: модель их не видит, и они не
     влияют на её анализ.
+
+    Основной результат — текстовый отчёт: он отправляется первым, и после этого пайплайн уже не может «упасть» (см.
+    _deliver_artifacts). Голос и чек-лист необязательны: сбой любого из них даёт одно короткое сообщение и не
+    касается ни отчёта, ни другого файла.
     """
     try:
-        status_msg = await bot.send_message(user_id, "⏳ Обрабатываю…")
+        status_msg = await bot.send_message(user_id, STATUS_PROCESSING)
 
         # 1. Проверка файлов (до любых платных вызовов; повторяет проверку при загрузке: run_pipeline самодостаточен)
         document = await asyncio.to_thread(_validate_inputs, doc_path, voice_path)
@@ -148,7 +157,7 @@ async def run_pipeline(
         )
 
         # 3. Автоматические проверки реквизитов: код по тексту документа, не по ответам модели. Не блокируют анализ.
-        automatic_checks = _automatic_checks_section(extraction)
+        automatic_section, checks = _run_automatic_checks(extraction)
 
         # 4. Транскрибация голоса
         transcript = await openai_service.transcribe_voice(voice_path)
@@ -166,34 +175,20 @@ async def run_pipeline(
         # 6. Пост-обработка: отчёт, текст озвучки и пункты чек-листа приходят структурой, а не разбираются из текста.
         report = await openai_service.generate_report(task=transcript, analysis=analysis)
 
-        # 7. TTS
-        tts_bytes = await tts_service.text_to_speech(compose_tts_script(report.tts_script, limit=TTS_INPUT_LIMIT))
-
-        # 8. Чек-лист (reportlab/Pillow блокируют поток, поэтому в отдельный поток)
-        checklist_bytes = await asyncio.to_thread(generate_checklist, report.checklist_items, output_format=checklist_format)
-        checklist_ext = "pdf" if checklist_format == "pdf" else "png"
-
-        # 9. Отправка
-        await status_msg.edit_text("📤 Отправляю результат…")
-        # Раздел автоматических проверок, заголовок «оценка модели», цитаты, строка охвата и дисклеймер формируются
-        # кодом и добавляются после сокращения текста модели, поэтому не могут потеряться. Если Markdown вызывает
-        # ошибку — шлём без форматирования.
+        # 7. Отчёт — основной результат. Раздел автоматических проверок, заголовок «оценка модели», цитаты, строка охвата
+        # и дисклеймер формируются кодом и добавляются после сокращения текста модели, поэтому не могут потеряться.
+        # Текст уходит как есть, без режима разметки: ни одна строка модели или документа не может его сломать.
         report_text = compose_report(
             report.text_report, findings, format_coverage(extraction), limit=REPORT_CHAR_LIMIT,
-            automatic=automatic_checks,
+            automatic=automatic_section,
         )
-        try:
-            await bot.send_message(user_id, report_text, parse_mode="Markdown")
-        except Exception:
-            await bot.send_message(user_id, report_text, parse_mode=None)
-        # Голосовое резюме
-        voice_input = BufferedInputFile(tts_bytes, filename="resume.mp3")
-        await bot.send_voice(user_id, voice=voice_input)
-        # Файл чек-листа
-        checklist_input = BufferedInputFile(checklist_bytes, filename=f"checklist.{checklist_ext}")
-        await bot.send_document(user_id, document=checklist_input, caption=CHECKLIST_CAPTION)
+        await bot.send_message(user_id, report_text)
 
-        await status_msg.delete()
+        # 8. Голос и чек-лист: после отчёта, каждый сам по себе и без права сорвать пайплайн.
+        await _deliver_artifacts(
+            bot, user_id, status_msg, tts_service, report,
+            checks=checks, ocr_used=METHOD_VISION in extraction.extraction_methods,
+        )
 
     except AIServiceError as e:
         logger.error("pipeline failed: AI service: %s", e)  # исход и класс исходной ошибки, без текста провайдера/модели
@@ -203,21 +198,79 @@ async def run_pipeline(
         await bot.send_message(user_id, ERROR_MSG)
 
 
-def _automatic_checks_section(extraction: DocumentExtractionResult) -> str:
+def _run_automatic_checks(extraction: DocumentExtractionResult) -> tuple[str, list[DeterministicCheck]]:
     """
-    Готовый раздел отчёта с автоматическими проверками реквизитов. Вход — только текст документа; результаты модель
-    не видит. Это необязательный слой: его внутренний сбой не лишает пользователя оценки модели, но об этом
-    сообщается в отчёте. В лог идут только количества, не значения реквизитов.
+    Раздел отчёта с автоматическими проверками реквизитов (готовый текст) и сами результаты, из которых строится
+    раздел чек-листа. Вход — только текст документа; результаты модель не видит. Это необязательный слой: его
+    внутренний сбой не лишает пользователя оценки модели, но об этом сообщается в отчёте. В лог идут только
+    количества, не значения реквизитов.
     """
     try:
         checks = run_deterministic_checks(extraction.extracted_text, analysed_pages=extraction.analysed_pages)
     except Exception as e:
         log_failure(logger, "automatic_checks", e)
-        return format_automatic_checks(None)
+        return format_automatic_checks(None), []
     logger.info(
         "Automatic checks: %d, failed %d", len(checks), sum(1 for check in checks if check.status is CheckStatus.FAIL)
     )
-    return format_automatic_checks(checks, ocr_used=METHOD_VISION in extraction.extraction_methods)
+    return format_automatic_checks(checks, ocr_used=METHOD_VISION in extraction.extraction_methods), checks
+
+
+async def _deliver_artifacts(
+    bot: Bot, user_id: int, status_msg, tts_service: TTSService, report: ReportResult,
+    *, checks: list[DeterministicCheck], ocr_used: bool,
+) -> None:
+    """
+    Необязательные файлы после отчёта. Не бросает исключений: отчёт к этому моменту уже доставлен, и ничто здесь не
+    должно превратиться в «Произошла ошибка» поверх него. Каждый файл — отдельно: сбой голоса не мешает чек-листу.
+    """
+    await _set_status(status_msg, STATUS_ARTIFACTS)
+    await _send_voice_summary(bot, user_id, tts_service, report.tts_script, checks)
+    await _send_checklist(bot, user_id, report.checklist_items, checks, ocr_used)
+    await _delete_status(status_msg)
+
+
+async def _send_voice_summary(
+    bot: Bot, user_id: int, tts_service: TTSService, model_script: str, checks: list[DeterministicCheck]
+) -> None:
+    try:
+        # вслух — одна фраза о том, что автоматические проверки что-то выявили, а не сами проверки
+        failed = any(check.status is CheckStatus.FAIL for check in checks)
+        audio = await tts_service.text_to_speech(compose_tts_script(model_script, automatic_failed=failed))
+        await bot.send_voice(user_id, voice=BufferedInputFile(audio, filename="resume.mp3"))
+    except Exception as e:  # синтез, сеть, Telegram: для пользователя это одно и то же — голоса нет
+        log_failure(logger, "voice", e)
+        await _notify(bot, user_id, VOICE_FAILED_MSG)
+
+
+async def _send_checklist(
+    bot: Bot, user_id: int, items: list[ChecklistItem], checks: list[DeterministicCheck], ocr_used: bool
+) -> None:
+    try:
+        # reportlab блокирует поток, поэтому PDF строится в отдельном потоке
+        pdf = await asyncio.to_thread(generate_checklist, items, checks, ocr_used=ocr_used)
+        await bot.send_document(user_id, document=BufferedInputFile(pdf, filename="checklist.pdf"), caption=CHECKLIST_CAPTION)
+    except Exception as e:
+        log_failure(logger, "checklist", e)
+        await _notify(bot, user_id, CHECKLIST_FAILED_MSG)
+
+
+async def _notify(bot: Bot, user_id: int, text: str) -> None:
+    """Короткое сообщение о сбое необязательного файла; сам его сбой не должен ничего ломать."""
+    try:
+        await bot.send_message(user_id, text)
+    except Exception as e:
+        log_failure(logger, "notice", e)
+
+
+async def _set_status(status_msg, text: str) -> None:
+    with suppress(Exception):  # статус «Обрабатываю…» — украшение, его сбой не должен ничего ломать
+        await status_msg.edit_text(text)
+
+
+async def _delete_status(status_msg) -> None:
+    with suppress(Exception):
+        await status_msg.delete()
 
 
 def _validate_inputs(doc_path: Path, voice_path: Path) -> ValidatedDocument | Rejection:
@@ -232,8 +285,7 @@ def _validate_inputs(doc_path: Path, voice_path: Path) -> ValidatedDocument | Re
 async def _send_rejection(bot: Bot, user_id: int, status_msg, reason: Rejection) -> None:
     logger.info("Input rejected: %s", reason.value)
     await bot.send_message(user_id, REJECTION_MESSAGES[reason])
-    with suppress(Exception):  # статус «Обрабатываю…» — украшение, его сбой не должен заменять причину отказа
-        await status_msg.delete()
+    await _delete_status(status_msg)  # его сбой не должен заменять причину отказа
 
 
 async def _reply(message: Message, text: str) -> None:
@@ -339,7 +391,6 @@ async def _complete_session(
             doc_path,
             ai.openai,
             ai.tts,
-            config.CHECKLIST_FORMAT,
         )
     except Exception as e:
         # run_pipeline сам сообщает об ошибках; сюда попадаем, если не удалась и эта отправка.

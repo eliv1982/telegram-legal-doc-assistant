@@ -25,7 +25,6 @@ for _name in (
     "BOT_TOKEN",
     "OPENAI_API_KEY",
     "SESSION_TIMEOUT_MINUTES",
-    "CHECKLIST_FORMAT",
     "OPENAI_TIMEOUT_SECONDS",
     "OPENAI_MAX_RETRIES",
     "OPENAI_TRANSCRIPTION_MODEL",
@@ -110,7 +109,6 @@ def handler_env(monkeypatch, tmp_path) -> HandlerEnv:
     # Session workspaces are created under tempfile.gettempdir(); point it at the per-test directory.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(config, "SESSION_TIMEOUT_MINUTES", 10)
-    monkeypatch.setattr(document, "generate_checklist", lambda items, output_format="pdf": b"%PDF-placeholder")
 
     env = HandlerEnv(
         bot=FakeBot(), temp_dir=tmp_path, document=document,

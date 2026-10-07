@@ -10,6 +10,7 @@ import pytest
 
 from handlers import start
 from handlers.document import DOWNLOAD_ERROR_MSG, ERROR_MSG, SESSION_EXPIRED_MSG, WAIT_DOC_MSG
+from services.report import REPORT_HEADER
 from states.user_states import PENDING_FILE_KEY, STARTED_AT_KEY, WORKSPACE_KEY
 from tests.fakes import FAKE_BOT_TOKEN, FakeMessage, FakeOpenAIService
 
@@ -29,6 +30,18 @@ async def send(env, kind: str, state, unique_id: str = "x", user_id: int = 1) ->
 
 async def boom(*args, **kwargs):
     raise RuntimeError("simulated failure")
+
+
+def refuse_the_report(env, monkeypatch) -> None:
+    """Only the primary deliverable fails to go out (an optional file failing is tests/test_delivery.py)."""
+    real_send = env.bot.send_message
+
+    async def send_message(chat_id, text, **kwargs):
+        if REPORT_HEADER in text:
+            raise RuntimeError("simulated Telegram failure")
+        return await real_send(chat_id, text, **kwargs)
+
+    monkeypatch.setattr(env.bot, "send_message", send_message)
 
 
 def write_partial_then_fail(message: str = "simulated failure"):
@@ -79,7 +92,7 @@ async def test_start_discards_the_pending_workspace_and_resets_state(handler_env
     "break_it, reply_channel",
     [
         pytest.param(lambda env, mp: mp.setattr(FakeOpenAIService, "transcribe_voice", boom), "bot", id="pipeline-exception"),
-        pytest.param(lambda env, mp: mp.setattr(env.bot, "send_voice", boom), "bot", id="telegram-output-send-fails"),
+        pytest.param(lambda env, mp: refuse_the_report(env, mp), "bot", id="report-cannot-be-sent"),
         pytest.param(lambda env, mp: mp.setattr(env.bot, "send_message", boom), "message", id="error-report-also-fails"),
     ],
 )

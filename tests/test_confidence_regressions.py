@@ -45,7 +45,7 @@ async def run_with(tmp_path, *replies) -> FakeBot:
     voice_path.write_bytes(b"placeholder")
     doc_path.write_bytes(samples.png_bytes())
     bot = FakeBot()
-    await run_pipeline(bot, 1, voice_path, doc_path, OpenAIService(openai.client), FakeTTSService(), "pdf")
+    await run_pipeline(bot, 1, voice_path, doc_path, OpenAIService(openai.client), FakeTTSService())
     return bot
 
 

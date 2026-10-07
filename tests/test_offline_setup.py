@@ -27,6 +27,7 @@ MODULES = [
     "services.workspace",
     "states.user_states",
     "utils.logging_config",
+    "utils.text",
 ]
 
 

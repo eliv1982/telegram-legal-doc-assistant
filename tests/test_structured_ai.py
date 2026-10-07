@@ -173,7 +173,7 @@ async def test_each_service_outcome_reaches_the_user_as_its_own_message(tmp_path
                 raise AIServiceError(kind, "SomeSdkError")
 
         bot = FakeBot()
-        await run_pipeline(bot, 1, voice_path, doc_path, Failing(), FakeTTSService(), "pdf")
+        await run_pipeline(bot, 1, voice_path, doc_path, Failing(), FakeTTSService())
         seen[kind] = bot.sent_texts[-1]
 
     assert seen == AI_FAILURE_MESSAGES

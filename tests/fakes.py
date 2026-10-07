@@ -52,6 +52,7 @@ class FakeBot:
 
     def __init__(self) -> None:
         self.sent_texts: list[str] = []
+        self.sent_kwargs: list[dict] = []  # the keyword arguments of each send_message, parallel to sent_texts
         self.sent_voices: list[object] = []
         self.sent_documents: list[object] = []
         self.document_captions: list[str | None] = []
@@ -77,6 +78,7 @@ class FakeBot:
 
     async def send_message(self, chat_id: int, text: str, **kwargs) -> FakeStatusMessage:
         self.sent_texts.append(text)
+        self.sent_kwargs.append(kwargs)
         return FakeStatusMessage()
 
     async def send_voice(self, chat_id: int, voice: object, **kwargs) -> None:
@@ -170,9 +172,11 @@ def make_report(text_report: str = "Отчёт", tts_script: str = "Резюме
 class FakeTTSService:
     def __init__(self) -> None:
         self.calls = 0
+        self.texts: list[str] = []  # what was asked to be spoken
 
     async def text_to_speech(self, text: str) -> bytes:
         self.calls += 1
+        self.texts.append(text)
         return b"ID3placeholder"
 
 

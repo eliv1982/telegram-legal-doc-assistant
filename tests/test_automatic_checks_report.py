@@ -90,7 +90,7 @@ def test_the_worst_case_still_fits_telegram_with_coverage_and_disclaimer_intact(
     assert report.endswith(f"{COVERAGE}\n\n{DISCLAIMER}")
 
 
-def test_what_the_code_writes_claims_no_existence_and_cannot_break_telegram_markdown():
+def test_what_the_code_writes_claims_no_existence_and_shows_only_normalised_values():
     text = "ИНН 7707083893 ИНН 7707083894 ИНН 7707_083893 КПП 7701*1001 БИК [044525225] р/с `40702810300000012345`"
 
     block = format_automatic_checks(run_deterministic_checks(text))

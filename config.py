@@ -15,9 +15,6 @@ def getenv(key: str, default: str = "") -> str:
 BOT_TOKEN = getenv("BOT_TOKEN")
 OPENAI_API_KEY = getenv("OPENAI_API_KEY")
 SESSION_TIMEOUT_MINUTES = int(getenv("SESSION_TIMEOUT_MINUTES", "10"))
-CHECKLIST_FORMAT = getenv("CHECKLIST_FORMAT", "pdf").lower()
-if CHECKLIST_FORMAT not in ("pdf", "png"):
-    CHECKLIST_FORMAT = "pdf"
 
 # Клиент OpenAI: один на процесс (см. services/openai_client.py). Тайм-аут — на один HTTP-запрос;
 # повторы (429, 5xx, сетевые сбои) делает сам SDK с задержкой между попытками.

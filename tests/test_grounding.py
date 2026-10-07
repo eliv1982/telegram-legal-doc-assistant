@@ -105,7 +105,7 @@ async def test_marker_strings_in_the_document_or_in_the_model_text_cannot_move_r
     monkeypatch.setattr(FakeOpenAIService, "extract_text_from_image", hostile_document)
     monkeypatch.setattr(FakeOpenAIService, "generate_report", spoofing_report)
     monkeypatch.setattr(env.ai.tts, "text_to_speech", speak)
-    monkeypatch.setattr(env.document, "generate_checklist", lambda items, output_format="pdf": checklists.append(items) or b"%PDF")
+    monkeypatch.setattr(env.document, "generate_checklist", lambda items, checks=(), *, ocr_used=False: checklists.append(items) or b"%PDF")
 
     state = env.new_state()
     await env.document.handle_document(FakeMessage.with_document(), state, env.bot, env.ai)

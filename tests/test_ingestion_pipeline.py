@@ -156,7 +156,7 @@ async def test_the_pipeline_alone_refuses_invalid_documents_before_any_openai_ca
     (tmp_path / "doc.bin").write_bytes(data)
 
     await handler_env.document.run_pipeline(
-        bot, 1, tmp_path / "voice.ogg", tmp_path / "doc.bin", OpenAIService(openai.client), tts, "pdf"
+        bot, 1, tmp_path / "voice.ogg", tmp_path / "doc.bin", OpenAIService(openai.client), tts
     )
 
     assert openai.requests == [] and tts.calls == 0
@@ -172,7 +172,7 @@ async def test_an_empty_voice_is_refused_before_vision_is_paid_for(handler_env, 
     (tmp_path / "scan.png").write_bytes(samples.png_bytes())
 
     await handler_env.document.run_pipeline(
-        bot, 1, tmp_path / "voice.ogg", tmp_path / "scan.png", OpenAIService(openai.client), FakeTTSService(), "pdf"
+        bot, 1, tmp_path / "voice.ogg", tmp_path / "scan.png", OpenAIService(openai.client), FakeTTSService()
     )
 
     assert openai.requests == []  # neither Vision nor Whisper
@@ -477,7 +477,7 @@ async def test_a_tiny_pdf_with_absurd_page_dimensions_is_refused_by_preflight_be
 
     assert validate_document(tmp_path / "hostile.pdf") is Rejection.PAGE_SIZE
     await handler_env.document.run_pipeline(
-        bot, 1, tmp_path / "voice.ogg", tmp_path / "hostile.pdf", OpenAIService(openai.client), FakeTTSService(), "pdf"
+        bot, 1, tmp_path / "voice.ogg", tmp_path / "hostile.pdf", OpenAIService(openai.client), FakeTTSService()
     )
 
     assert REJECTION_MESSAGES[Rejection.PAGE_SIZE] in bot.sent_texts

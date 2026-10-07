@@ -1,0 +1,4 @@
+# The bundled font and its licence are third-party files: keep them byte-for-byte as upstream published them
+# (no line-ending conversion, and no whitespace checks: the licence text has trailing spaces).
+assets/fonts/*.ttf binary
+assets/fonts/OFL.txt -text -whitespace

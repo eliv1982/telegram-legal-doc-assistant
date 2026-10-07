@@ -9,12 +9,17 @@
 Четыре вида содержимого различимы: автоматические проверки — результат кода по формату и контрольным числам; охват —
 факт об извлечении; текст модели — её оценка; цитата показывается как цитата только после проверки по тексту
 документа (services.grounding). Результаты проверок модель не видит и не переписывает.
+
+Сообщения уходят обычным текстом, без режима разметки Telegram (Markdown/HTML): текст модели, цитаты и значения
+реквизитов не нужно экранировать, и ни одна из их строк не может ни сломать отправку, ни создать форматирование.
 """
 from collections.abc import Sequence
 
+from services import limits
 from services.deterministic_checks import CheckStatus, DeterministicCheck
 from services.grounding import GroundedIssue
 from services.schemas import PRIORITY_LABELS
+from utils.text import fit_text, fit_words
 
 AUTOMATIC_HEADER = "🔎 Автоматические проверки реквизитов (код, без участия ИИ)"
 AUTOMATIC_NOTE = (
@@ -38,19 +43,17 @@ DISCLAIMER = (
     "Оценку выполнила модель ИИ: она может ошибаться и не заменяет проверку юристом."
 )
 TTS_DISCLAIMER = "Это предварительная оценка модели, а не юридическая консультация."
+# Автоматические проверки вслух не зачитываются: достаточно одной фразы, и только если какая-то проверка не прошла.
+TTS_AUTOMATIC_FAILED = "Автоматические проверки реквизитов выявили замечания."
 
 QUOTES_HEADER = "📎 Цитаты из документа (найдены в его тексте дословно):"
 # Блок цитат ограничен, чтобы отчёту модели всегда оставалось место.
 MAX_QUOTES_CHARS = 1200
 ELLIPSIS = "…"
+# Пометка в конце сокращённого текста модели: пользователь должен видеть, что это не весь текст.
+SHORTENED_MARKER = f"\n{ELLIPSIS} (сокращено по лимиту сообщения Telegram)"
 
 _SEPARATOR = "\n\n"
-_MARKDOWN_SPECIALS = "_*`["
-
-
-def escape_markdown(text: str) -> str:
-    """Экранирование для Markdown Telegram (режим по умолчанию бота): цитата не должна ломать разметку сообщения."""
-    return "".join(f"\\{ch}" if ch in _MARKDOWN_SPECIALS else ch for ch in text)
 
 
 def _quotes_block(findings: Sequence[GroundedIssue]) -> str:
@@ -61,7 +64,7 @@ def _quotes_block(findings: Sequence[GroundedIssue]) -> str:
         used = len(QUOTES_HEADER)
         for index, finding in enumerate(quoted):
             label = PRIORITY_LABELS[finding.issue.priority]
-            line = f"• [{label}] {escape_markdown(finding.issue.title)}: «{escape_markdown(finding.verified_evidence)}»"
+            line = f"• [{label}] {finding.issue.title}: «{finding.verified_evidence}»"
             if used + len(line) + 1 > MAX_QUOTES_CHARS:
                 lines.append(f"…и ещё цитат: {len(quoted) - index}")
                 break
@@ -76,9 +79,14 @@ def _quotes_block(findings: Sequence[GroundedIssue]) -> str:
     return "\n".join(lines)
 
 
-def _check_line(check: DeterministicCheck) -> str:
+def describe_check(check: DeterministicCheck) -> str:
+    """Результат проверки одной строкой без значка статуса. Один текст и для отчёта, и для чек-листа."""
     pages = f" (стр. {', '.join(map(str, check.pages))})" if check.pages else ""
-    return f"{_STATUS_ICONS[check.status]} {check.label} {check.value}{pages} — {check.message}"
+    return f"{check.label} {check.value}{pages} — {check.message}"
+
+
+def _check_line(check: DeterministicCheck) -> str:
+    return f"{_STATUS_ICONS[check.status]} {describe_check(check)}"
 
 
 def format_automatic_checks(checks: Sequence[DeterministicCheck] | None, *, ocr_used: bool = False) -> str:
@@ -116,20 +124,28 @@ def compose_report(
     """
     Сообщение с отчётом не длиннее `limit`. Сокращается только текст модели: раздел автоматических проверок
     (`automatic`, готовый текст format_automatic_checks), заголовок, цитаты, охват и дисклеймер добавляются целиком
-    (их размер ограничен, см. MAX_CHECKS_CHARS и MAX_QUOTES_CHARS).
+    (их размер ограничен, см. MAX_CHECKS_CHARS и MAX_QUOTES_CHARS). Текст модели обрывается по границе абзаца,
+    строки, предложения или слова и получает пометку о сокращении.
     """
     quotes = _quotes_block(findings)
     footer = f"{coverage}{_SEPARATOR}{DISCLAIMER}"
     head = [automatic] if automatic else []
     fixed = [*head, REPORT_HEADER, *([quotes] if quotes else []), footer]
     budget = limit - sum(len(part) for part in fixed) - len(_SEPARATOR) * len(fixed)
-    body = model_text.strip()
-    if len(body) > budget:
-        body = body[: max(budget - len(ELLIPSIS), 0)].rstrip() + ELLIPSIS
+    body = fit_text(model_text.strip(), budget, marker=SHORTENED_MARKER)
     return _SEPARATOR.join([*head, REPORT_HEADER, body, *([quotes] if quotes else []), footer])
 
 
-def compose_tts_script(model_script: str, *, limit: int) -> str:
-    """Текст для озвучки; пометка о предварительной оценке добавляется после сокращения и не теряется."""
-    suffix = f" {TTS_DISCLAIMER}"
-    return model_script.strip()[: limit - len(suffix)] + suffix
+def compose_tts_script(model_script: str, *, automatic_failed: bool = False) -> str:
+    """
+    Текст для озвучки: пересказ модели в пределах бюджета limits.TTS_MAX_WORDS (обрыв по границе предложения, слово
+    не режется) и фиксированные пометки кода. Пометки добавляются после сокращения и не теряются: о предварительной
+    оценке модели — всегда, об автоматических проверках — одной фразой и только если какая-то проверка не прошла
+    (`automatic_failed`). Сами проверки вслух не зачитываются, выводов код не делает.
+    """
+    suffix = " ".join([TTS_AUTOMATIC_FAILED, TTS_DISCLAIMER] if automatic_failed else [TTS_DISCLAIMER])
+    summary = fit_words(" ".join(model_script.split()), limits.TTS_MAX_WORDS)
+    summary = fit_text(summary, limits.TTS_INPUT_LIMIT - len(suffix) - 1)  # страховка от предела API; обычно не срабатывает
+    if summary and summary[-1] not in ".!?…":
+        summary += "."  # пометка начинается с новой фразы
+    return f"{summary} {suffix}"
