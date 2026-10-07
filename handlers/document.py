@@ -22,10 +22,14 @@ from states.user_states import (
     session_expired,
 )
 from services import limits
-from services.openai_service import OpenAIService
-from services.tts_service import TTSService
+from services.ai_errors import AIFailure, AIServiceError
 from services.checklist_generator import generate_checklist
 from services.document_extraction import extract_document, format_coverage
+from services.grounding import ground_issues
+from services.openai_client import AIServices
+from services.openai_service import OpenAIService
+from services.report import compose_report, compose_tts_script
+from services.tts_service import TTS_INPUT_LIMIT, TTSService
 from services.validation import (
     Rejection,
     ValidatedDocument,
@@ -34,7 +38,6 @@ from services.validation import (
     validate_voice,
 )
 from services.workspace import SessionWorkspace
-from utils.helpers import parse_confidence
 from utils.logging_config import log_failure
 
 router = Router()
@@ -45,17 +48,29 @@ logger = logging.getLogger(__name__)
 ALLOWED_DOC_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".webp"}
 MIME_TO_EXT = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
-REPORT_CHAR_LIMIT = 4000  # с запасом до лимита Telegram в 4096; строка охвата в него входит
+REPORT_CHAR_LIMIT = 4000  # с запасом до лимита Telegram в 4096; строка охвата и дисклеймер в него входят
+# Файл чек-листа живёт отдельно от отчёта и может уйти дальше сам по себе, поэтому пометка об оценке модели — в подписи.
+CHECKLIST_CAPTION = "📋 Чек-лист (предварительная оценка модели, не юридическая консультация)"
 
 ERROR_MSG = "Произошла ошибка при обработке. Попробуйте позже."
 DOWNLOAD_ERROR_MSG = "Не удалось получить файл из Telegram. Отправьте его ещё раз."
 SESSION_EXPIRED_MSG = "⌛ Предыдущая незавершённая сессия истекла, её файлы удалены. Начинаю новую."
 WAIT_DOC_MSG = "✅ Голос получен. Отправь документ (PDF или изображение)."
 WAIT_VOICE_MSG = "✅ Документ получен. Отправь голосовое сообщение с задачей."
-LOW_CONFIDENCE_MSG = (
-    "⚠️ Качество распознавания документа низкое. Отправьте документ заново в лучшем разрешении "
-    "(чёткая фотография или скан) или попробуйте PDF с текстовым слоем."
-)
+
+# Исходы вызова ИИ (services.ai_errors). Ни одно сообщение не говорит о качестве документа: о нём сообщает только
+# детерминированное извлечение (REJECTION_MESSAGES). Текста ошибки провайдера и модели здесь нет.
+AI_FAILURE_MESSAGES: dict[AIFailure, str] = {
+    AIFailure.CONFIG: "Сервис ИИ сейчас недоступен из-за ошибки настройки бота. Сообщите об этом администратору.",
+    AIFailure.UNAVAILABLE: "Сервис ИИ временно недоступен или перегружен. Попробуйте позже.",
+    AIFailure.TIMEOUT: "Сервис ИИ не ответил вовремя. Попробуйте ещё раз.",
+    AIFailure.REFUSED: (
+        "Модель отказалась обработать этот документ или запрос. "
+        "Попробуйте другой документ или иначе сформулируйте задачу."
+    ),
+    AIFailure.TRUNCATED: "Ответ модели оборвался и получился неполным. Попробуйте ещё раз или отправьте документ покороче.",
+    AIFailure.INVALID_OUTPUT: "Модель вернула ответ в непредусмотренном формате. Попробуйте ещё раз.",
+}
 
 # Постоянные отказы: дело в самом файле, поэтому нет «попробуйте позже», а есть что с ним сделать.
 # Временные сбои OpenAI/Telegram идут отдельным путём (ERROR_MSG, DOWNLOAD_ERROR_MSG).
@@ -133,56 +148,32 @@ async def run_pipeline(
         transcript = await openai_service.transcribe_voice(voice_path)
         logger.info("Transcribed: %d chars", len(transcript))
 
-        # 4. Анализ
+        # 4. Анализ: типизированный результат модели. Сбой формата, отказ и обрыв — это AIServiceError, а не «плохой документ».
         analysis = await openai_service.analyze_document(transcript, extraction.analysis_text)
-        confidence = parse_confidence(analysis.get("confidence"))
-
-        # 4.1 Проверка confidence: при низком — запрос перезагрузки. Повторный разбор текстового слоя
-        # здесь не нужен: текстовый слой PDF теперь читается первым (см. services.document_extraction).
-        if confidence < config.CONFIDENCE_THRESHOLD:
-            await status_msg.delete()
-            await bot.send_message(user_id, LOW_CONFIDENCE_MSG)
-            return
-
-        doc_type = analysis.get("document_type", "документ")
-        user_task = analysis.get("user_task", transcript[:200])
-        # Поддержка issues_found (список dict с description/priority или строк) и issues (старый формат)
-        issues_raw = analysis.get("issues_found")
-        if issues_raw is None:
-            issues_raw = analysis.get("issues", [])
-        issues = []
-        for x in issues_raw:
-            if isinstance(x, dict):
-                desc = x.get("description", str(x))
-                prio = x.get("priority", "")
-                issues.append(f"[{prio}] {desc}" if prio else desc)
-            else:
-                issues.append(str(x))
-
-        # 5. Пост-обработка
-        sections = await openai_service.generate_response_sections(
-            analysis_json=analysis,
-            document_type=doc_type,
-            user_task=user_task,
-            issues_list=issues,
+        # Цитаты проверяются по тексту документа (без служебной пометки об охвате, которую добавляет код).
+        findings = ground_issues(analysis.issues, extraction.extracted_text)
+        logger.info(
+            "Analysis: %d issues, %d with a verified quote",
+            len(findings), sum(1 for finding in findings if finding.verified_evidence),
         )
-        text_report = sections.get("text_report", "Отчёт не сформирован.")
-        tts_script = sections.get("tts_script", "Анализ завершён.")
-        checklist_text = sections.get("checklist", "□ Результаты анализа")
+
+        # 5. Пост-обработка: отчёт, текст озвучки и пункты чек-листа приходят структурой, а не разбираются из текста.
+        report = await openai_service.generate_report(task=transcript, analysis=analysis)
 
         # 6. TTS
-        tts_bytes = await tts_service.text_to_speech(tts_script)
+        tts_bytes = await tts_service.text_to_speech(compose_tts_script(report.tts_script, limit=TTS_INPUT_LIMIT))
 
         # 7. Чек-лист (reportlab/Pillow блокируют поток, поэтому в отдельный поток)
-        checklist_bytes = await asyncio.to_thread(generate_checklist, checklist_text, output_format=checklist_format)
+        checklist_bytes = await asyncio.to_thread(generate_checklist, report.checklist_items, output_format=checklist_format)
         checklist_ext = "pdf" if checklist_format == "pdf" else "png"
 
         # 8. Отправка
         await status_msg.edit_text("📤 Отправляю результат…")
-        # Строка охвата формируется кодом и добавляется после обрезки отчёта, поэтому не может потеряться.
-        # Текстовый отчёт (если Markdown вызывает ошибку — отправляем без форматирования)
-        coverage = format_coverage(extraction)
-        report_text = f"{text_report[: REPORT_CHAR_LIMIT - len(coverage) - 2]}\n\n{coverage}"
+        # Заголовок «оценка модели», цитаты, строка охвата и дисклеймер формируются кодом и добавляются после
+        # сокращения текста модели, поэтому не могут потеряться. Если Markdown вызывает ошибку — шлём без форматирования.
+        report_text = compose_report(
+            report.text_report, findings, format_coverage(extraction), limit=REPORT_CHAR_LIMIT
+        )
         try:
             await bot.send_message(user_id, report_text, parse_mode="Markdown")
         except Exception:
@@ -192,10 +183,13 @@ async def run_pipeline(
         await bot.send_voice(user_id, voice=voice_input)
         # Файл чек-листа
         checklist_input = BufferedInputFile(checklist_bytes, filename=f"checklist.{checklist_ext}")
-        await bot.send_document(user_id, document=checklist_input, caption="📋 Чек-лист")
+        await bot.send_document(user_id, document=checklist_input, caption=CHECKLIST_CAPTION)
 
         await status_msg.delete()
 
+    except AIServiceError as e:
+        logger.error("pipeline failed: AI service: %s", e)  # исход и класс исходной ошибки, без текста провайдера/модели
+        await bot.send_message(user_id, AI_FAILURE_MESSAGES[e.kind])
     except Exception as e:
         log_failure(logger, "pipeline", e)
         await bot.send_message(user_id, ERROR_MSG)
@@ -289,7 +283,7 @@ async def _start_or_replace_session(
 
 async def _complete_session(
     message: Message, state: FSMContext, bot: Bot, data: dict,
-    file_id: str, is_voice: bool, doc_ext: str,
+    file_id: str, is_voice: bool, doc_ext: str, ai: AIServices,
 ) -> None:
     """Пришла вторая половина: скачать, запустить пайплайн. Рабочая директория удаляется в finally."""
     workspace_dir = data.get(WORKSPACE_KEY)
@@ -318,8 +312,8 @@ async def _complete_session(
             message.from_user.id if message.from_user else 0,
             voice_path,
             doc_path,
-            OpenAIService(api_key=config.OPENAI_API_KEY),
-            TTSService(openai_api_key=config.OPENAI_API_KEY),
+            ai.openai,
+            ai.tts,
             config.CHECKLIST_FORMAT,
         )
     except Exception as e:
@@ -331,7 +325,7 @@ async def _complete_session(
 
 
 async def _receive_input(
-    message: Message, state: FSMContext, bot: Bot, file_id: str, is_voice: bool, doc_ext: str = "",
+    message: Message, state: FSMContext, bot: Bot, ai: AIServices, file_id: str, is_voice: bool, doc_ext: str = "",
 ) -> None:
     """Общая логика для голоса и документа/фото: связывает их в сессию в любом порядке."""
     data = await state.get_data()
@@ -344,29 +338,31 @@ async def _receive_input(
 
     # Голос завершает сессию, начатую документом, и наоборот.
     completes_with = UserSessionState.waiting_for_voice if is_voice else UserSessionState.waiting_for_document
-    handle = _complete_session if current == completes_with.state else _start_or_replace_session
-    await handle(message, state, bot, data, file_id, is_voice, doc_ext)
+    if current == completes_with.state:
+        await _complete_session(message, state, bot, data, file_id, is_voice, doc_ext, ai)
+    else:
+        await _start_or_replace_session(message, state, bot, data, file_id, is_voice, doc_ext)
 
 
 @router.message(F.voice)
-async def handle_voice(message: Message, state: FSMContext, bot: Bot) -> None:
+async def handle_voice(message: Message, state: FSMContext, bot: Bot, ai: AIServices) -> None:
     """Обработка голосового сообщения."""
     if exceeds_upload_limit(message.voice.file_size):
         await _reply(message, REJECTION_MESSAGES[Rejection.TOO_LARGE])
         return
-    await _receive_input(message, state, bot, message.voice.file_id, is_voice=True)
+    await _receive_input(message, state, bot, ai, message.voice.file_id, is_voice=True)
 
 
 @router.message(F.photo)
-async def handle_photo(message: Message, state: FSMContext, bot: Bot) -> None:
+async def handle_photo(message: Message, state: FSMContext, bot: Bot, ai: AIServices) -> None:
     """Обработка фото (последнее изображение в медиа-группе)."""
     if not message.photo:
         return
-    await _receive_input(message, state, bot, message.photo[-1].file_id, is_voice=False, doc_ext=".jpg")
+    await _receive_input(message, state, bot, ai, message.photo[-1].file_id, is_voice=False, doc_ext=".jpg")
 
 
 @router.message(F.document)
-async def handle_document(message: Message, state: FSMContext, bot: Bot) -> None:
+async def handle_document(message: Message, state: FSMContext, bot: Bot, ai: AIServices) -> None:
     """Обработка документа (PDF, изображение)."""
     if not message.document:
         return
@@ -380,4 +376,4 @@ async def handle_document(message: Message, state: FSMContext, bot: Bot) -> None
     if exceeds_upload_limit(doc.file_size):  # заявленный размер известен до скачивания
         await _reply(message, REJECTION_MESSAGES[Rejection.TOO_LARGE])
         return
-    await _receive_input(message, state, bot, doc.file_id, is_voice=False, doc_ext=ext)
+    await _receive_input(message, state, bot, ai, doc.file_id, is_voice=False, doc_ext=ext)

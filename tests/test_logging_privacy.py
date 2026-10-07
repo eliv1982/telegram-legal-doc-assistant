@@ -5,10 +5,13 @@ and a redaction filter masks bot tokens / API keys as a second line of defence.
 import io
 import logging
 
+import pytest
+
 from handlers.document import ERROR_MSG
-from services import openai_service
+from services.ai_errors import AIFailure, AIServiceError
 from services.openai_service import OpenAIService
-from tests.fakes import FAKE_BOT_TOKEN, FakeMessage, FakeOpenAIClient, FakeOpenAIService
+from services.schemas import AnalysisResult, ChecklistItem, Issue, ReportResult
+from tests.fakes import FAKE_BOT_TOKEN, FakeMessage, FakeOpenAIService, ScriptedOpenAI, chat_response
 from utils.logging_config import REDACTED, RedactSecretsFilter, setup_logging
 
 FAKE_OPENAI_KEY = "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
@@ -76,27 +79,30 @@ class SentinelOpenAIService(FakeOpenAIService):
     async def extract_text_from_image(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> str:
         return "SENTINEL-DOCUMENT-TEXT"
 
-    async def analyze_document(self, voice_transcript: str, document_text: str) -> dict:
-        return {
-            "document_type": "SENTINEL-DOC-TYPE",
-            "confidence": 92,
-            "user_task": "SENTINEL-USER-TASK",
-            "issues_found": [{"description": "SENTINEL-ISSUE", "priority": "Низкий"}],
-        }
+    async def analyze_document(self, voice_transcript: str, document_text: str) -> AnalysisResult:
+        return AnalysisResult(
+            document_type="SENTINEL-DOC-TYPE",
+            summary="SENTINEL-SUMMARY",
+            key_facts=[],
+            issues=[Issue(priority="low", title="SENTINEL-ISSUE", description="SENTINEL-DESC", evidence="SENTINEL-QUOTE")],
+        )
 
-    async def generate_response_sections(self, **kwargs) -> dict[str, str]:
-        return {"text_report": "SENTINEL-REPORT", "tts_script": "SENTINEL-TTS", "checklist": "SENTINEL-CHECKLIST"}
+    async def generate_report(self, **kwargs) -> ReportResult:
+        return ReportResult(
+            text_report="SENTINEL-REPORT", tts_script="SENTINEL-TTS",
+            checklist_items=[ChecklistItem(priority="low", text="SENTINEL-CHECKLIST")],
+        )
 
 
 async def test_pipeline_logs_contain_no_user_or_document_derived_text(handler_env, monkeypatch, caplog):
     env = handler_env
-    monkeypatch.setattr(env.document, "OpenAIService", lambda **kwargs: SentinelOpenAIService())
+    env.ai.openai = SentinelOpenAIService()
     caplog.set_level(logging.DEBUG)
     state = env.new_state()
 
     async def run_session(unique_id: str) -> None:
-        await env.document.handle_document(FakeMessage.with_document(unique_id=unique_id), state, env.bot)
-        await env.document.handle_voice(FakeMessage.with_voice(unique_id), state, env.bot)
+        await env.document.handle_document(FakeMessage.with_document(unique_id=unique_id), state, env.bot, env.ai)
+        await env.document.handle_voice(FakeMessage.with_voice(unique_id), state, env.bot, env.ai)
 
     await run_session("ok")  # a successful run
     assert len(env.bot.sent_voices) == 1
@@ -104,7 +110,7 @@ async def test_pipeline_logs_contain_no_user_or_document_derived_text(handler_en
     async def leaky_failure(self, **kwargs):  # an exception whose text contains document content
         raise RuntimeError("SENTINEL-IN-EXCEPTION-TEXT SENTINEL-DOCUMENT-TEXT")
 
-    monkeypatch.setattr(SentinelOpenAIService, "generate_response_sections", leaky_failure)
+    monkeypatch.setattr(SentinelOpenAIService, "generate_report", leaky_failure)
     await run_session("failing")  # and a failing one
     assert ERROR_MSG in env.bot.sent_texts
 
@@ -112,12 +118,23 @@ async def test_pipeline_logs_contain_no_user_or_document_derived_text(handler_en
     assert "SENTINEL" not in caplog.text
 
 
-async def test_unparseable_analysis_response_is_not_logged(monkeypatch, caplog):
-    client = FakeOpenAIClient(chat_replies=["SENTINEL-MODEL-OUTPUT, certainly not JSON"])
-    monkeypatch.setattr(openai_service, "AsyncOpenAI", lambda api_key=None: client)
+@pytest.mark.parametrize(
+    "reply, failure",
+    [
+        pytest.param(chat_response("SENTINEL-MODEL-OUTPUT, certainly not JSON"), AIFailure.INVALID_OUTPUT, id="prose"),
+        pytest.param(chat_response('{"document_type": "SENTINEL-DOC", "summary": 5}'), AIFailure.INVALID_OUTPUT, id="wrong-schema"),
+        pytest.param(chat_response(None, refusal="SENTINEL-REFUSAL-TEXT"), AIFailure.REFUSED, id="refusal"),
+    ],
+)
+async def test_a_failed_model_response_is_neither_logged_nor_carried_in_the_error(reply, failure, caplog):
+    """Pydantic's own ValidationError text quotes the model output; the adapter must not let it out."""
     caplog.set_level(logging.DEBUG)
+    openai = ScriptedOpenAI(reply)
 
-    await OpenAIService(api_key="offline-test-key").analyze_document("task", "document")
+    with pytest.raises(AIServiceError) as raised:
+        await OpenAIService(openai.client).analyze_document("task", "document")
 
-    assert "Не удалось распарсить JSON" in caplog.text
-    assert "SENTINEL" not in caplog.text
+    assert raised.value.kind is failure
+    assert "SENTINEL" not in caplog.text and "SENTINEL" not in repr(raised.value) and "SENTINEL" not in str(raised.value)
+    error = raised.value
+    assert error.__cause__ is None and (error.__context__ is None or error.__suppress_context__)  # nothing chained to print later

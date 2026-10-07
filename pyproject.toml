@@ -10,6 +10,8 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
     "aiogram>=3.13.0",
     "openai>=1.40.0",
+    # Imported directly (services/schemas.py): the structured-output models. The openai SDK needs it too (v2 API).
+    "pydantic>=2.7",
     "python-dotenv>=1.0.0",
     "reportlab>=4.2.0",
     # Parsers of untrusted uploads: floors sit above the published DoS/memory-safety fixes

@@ -3,15 +3,20 @@ Offline stand-ins for Telegram and OpenAI used by the handler/pipeline tests.
 Nothing here opens a socket.
 """
 import asyncio
+import json
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx2  # the HTTP layer of the pinned openai SDK: its MockTransport lets the real SDK run without a socket
 from aiogram.fsm.storage.base import BaseEventIsolation, StorageKey
 from aiogram.types import Chat, Document, Message, Update, User, Voice
+from openai import AsyncOpenAI
+from pydantic import BaseModel
 
+from services.schemas import AnalysisResult, ChecklistItem, Issue, ReportResult
 from tests import samples
 
 # What FakeBot.download_file serves by destination suffix; a voice file (.ogg) stays an opaque placeholder.
@@ -49,6 +54,7 @@ class FakeBot:
         self.sent_texts: list[str] = []
         self.sent_voices: list[object] = []
         self.sent_documents: list[object] = []
+        self.document_captions: list[str | None] = []
         # Lets a test hold a download open (see test_fsm_regressions.py) without any sleeps.
         self.before_download: Callable[[str], Awaitable[None]] | None = None
         # remote path ("remote/<file_id>") -> bytes to serve instead of the default sample for the file type
@@ -78,6 +84,7 @@ class FakeBot:
 
     async def send_document(self, chat_id: int, document: object, **kwargs) -> None:
         self.sent_documents.append(document)
+        self.document_captions.append(kwargs.get("caption"))
 
 
 class FakeMessage:
@@ -119,6 +126,7 @@ class FakeOpenAIService:
         self.calls: list[str] = []
         self.ocr_images: list[bytes] = []  # what Vision was asked to read
         self.analysis_inputs: list[str] = []  # the document text the analysis model was given
+        self.report_inputs: list[AnalysisResult] = []  # what the report model was given
 
     async def transcribe_voice(self, audio_path) -> str:
         self.calls.append("transcribe_voice")
@@ -129,19 +137,34 @@ class FakeOpenAIService:
         self.ocr_images.append(image_bytes)
         return "Текст договора"
 
-    async def analyze_document(self, voice_transcript: str, document_text: str) -> dict:
+    async def analyze_document(self, voice_transcript: str, document_text: str) -> AnalysisResult:
         self.calls.append("analyze_document")
         self.analysis_inputs.append(document_text)
-        return {
-            "document_type": "Договор",
-            "confidence": 92,
-            "user_task": "Анализ рисков",
-            "issues_found": [{"description": "Нечёткая формулировка", "priority": "Низкий"}],
-        }
+        return make_analysis()
 
-    async def generate_response_sections(self, **kwargs) -> dict[str, str]:
-        self.calls.append("generate_response_sections")
-        return {"text_report": "Отчёт", "tts_script": "Резюме", "checklist": "□ Проверить контрагента"}
+    async def generate_report(self, *, task: str, analysis: AnalysisResult) -> ReportResult:
+        self.calls.append("generate_report")
+        self.report_inputs.append(analysis)
+        return make_report()
+
+
+def make_analysis(*issues: Issue) -> AnalysisResult:
+    """No findings unless given: 'the model found nothing' is a valid result, and it keeps the report text exact."""
+    return AnalysisResult(
+        document_type="Договор", summary="Краткая суть договора.", key_facts=[], issues=list(issues)
+    )
+
+
+def make_issue(title: str = "Нечёткая формулировка", evidence: str | None = None, priority="low") -> Issue:
+    return Issue(priority=priority, title=title, description="Описание замечания.", evidence=evidence)
+
+
+def make_report(text_report: str = "Отчёт", tts_script: str = "Резюме", *items: ChecklistItem) -> ReportResult:
+    return ReportResult(
+        text_report=text_report,
+        tts_script=tts_script,
+        checklist_items=list(items) or [ChecklistItem(priority="high", text="Проверить контрагента")],
+    )
 
 
 class FakeTTSService:
@@ -153,36 +176,63 @@ class FakeTTSService:
         return b"ID3placeholder"
 
 
-class FakeOpenAIClient:
+def chat_response(content: str | None = None, *, refusal: str | None = None, finish_reason: str = "stop") -> httpx2.Response:
+    """A well-formed /chat/completions reply, as the real API would send it."""
+    message = {"role": "assistant", "content": content, "refusal": refusal}
+    return httpx2.Response(200, json={
+        "id": "chatcmpl-offline", "object": "chat.completion", "created": 1, "model": "offline",
+        "choices": [{"index": 0, "finish_reason": finish_reason, "message": message}],
+    })
+
+
+def structured_response(result: BaseModel, **extra) -> httpx2.Response:
+    """A structured-output reply: the model's JSON, optionally with extra (unknown) fields mixed in."""
+    return chat_response(json.dumps({**result.model_dump(), **extra}, ensure_ascii=False))
+
+
+def speech_response(audio: bytes = b"ID3placeholder") -> httpx2.Response:
+    return httpx2.Response(200, content=audio, headers={"content-type": "audio/mpeg"})
+
+
+def transcription_response(text: str = "Проверь договор на риски") -> httpx2.Response:
+    return httpx2.Response(200, text=text, headers={"content-type": "text/plain"})
+
+
+def error_response(status: int, code: str | None = None) -> httpx2.Response:
+    return httpx2.Response(status, json={"error": {"message": "SENTINEL-PROVIDER-TEXT", "type": "x", "code": code}})
+
+
+class ScriptedOpenAI:
     """
-    Stands in for `AsyncOpenAI` so the *real* OpenAIService can run offline.
-    `chat_replies` are returned in order by successive chat.completions.create calls.
+    The REAL `AsyncOpenAI` of the pinned SDK (real request building, response parsing and exception classes) on a
+    scripted transport: replies are served in order, and no socket is ever opened. `max_retries=0` keeps error replies instant.
     """
 
-    def __init__(self, chat_replies: list[str], transcript: str = "Проверь договор на риски") -> None:
-        self._chat_replies = list(chat_replies)
-        self._transcript = transcript
-        self.chat_calls = 0
-        self.transcribe_calls = 0
-        self.speech_calls: list[dict] = []
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat_create))
-        self.audio = SimpleNamespace(
-            transcriptions=SimpleNamespace(create=self._transcribe),
-            speech=SimpleNamespace(create=self._speech),
+    def __init__(self, *replies: httpx2.Response | Exception) -> None:
+        self.requests: list[httpx2.Request] = []
+        self._replies = list(replies)
+        self.client = AsyncOpenAI(
+            api_key="offline-test-key",
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(self._handle)),
         )
 
-    async def _chat_create(self, **kwargs) -> SimpleNamespace:
-        self.chat_calls += 1
-        content = self._chat_replies.pop(0)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+    def _handle(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        if not self._replies:
+            raise AssertionError(f"unscripted OpenAI request: {request.url.path}")
+        reply = self._replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
-    async def _transcribe(self, **kwargs) -> str:
-        self.transcribe_calls += 1
-        return self._transcript
+    @property
+    def paths(self) -> list[str]:
+        return [request.url.path for request in self.requests]
 
-    async def _speech(self, **kwargs) -> SimpleNamespace:
-        self.speech_calls.append(kwargs)
-        return SimpleNamespace(content=b"ID3placeholder")
+    def json_bodies(self) -> list[dict]:
+        """The JSON bodies the SDK actually put on the wire (multipart uploads are skipped)."""
+        return [json.loads(r.content) for r in self.requests if r.headers["content-type"].startswith("application/json")]
 
 
 class Gate:

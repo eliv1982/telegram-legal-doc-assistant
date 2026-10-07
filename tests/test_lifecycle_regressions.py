@@ -15,8 +15,8 @@ async def test_voice_first_then_document_leaves_no_input_files(handler_env):
     env = handler_env
     state = env.new_state()
 
-    await env.document.handle_voice(FakeMessage.with_voice(), state, env.bot)
-    await env.document.handle_document(FakeMessage.with_document(), state, env.bot)
+    await env.document.handle_voice(FakeMessage.with_voice(), state, env.bot, env.ai)
+    await env.document.handle_document(FakeMessage.with_document(), state, env.bot, env.ai)
 
     assert env.pipeline_calls == [1]
     assert len(env.bot.sent_voices) == 1  # the pipeline ran to the end
@@ -31,8 +31,8 @@ async def test_document_first_then_voice_leaves_no_input_files(handler_env):
     env = handler_env
     state = env.new_state()
 
-    await env.document.handle_document(FakeMessage.with_document(), state, env.bot)
-    await env.document.handle_voice(FakeMessage.with_voice(), state, env.bot)
+    await env.document.handle_document(FakeMessage.with_document(), state, env.bot, env.ai)
+    await env.document.handle_voice(FakeMessage.with_voice(), state, env.bot, env.ai)
 
     if env.pipeline_calls != [1] or len(env.bot.sent_voices) != 1:  # harness check, not the defect
         pytest.fail("the fake pipeline did not run to completion")

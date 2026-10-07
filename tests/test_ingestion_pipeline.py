@@ -1,8 +1,8 @@
 """
 Ingestion through the handlers and the pipeline (Stage 3): invalid input fails locally and for free, in either
 upload order; valid input proceeds in the order validate -> extract -> transcribe -> analyse; every successful
-report carries a coverage line written by code. Offline: OpenAI and Telegram are fakes, Poppler is stubbed
-except where a test says otherwise.
+report carries a coverage line written by code. Offline: OpenAI and Telegram are fakes (or the real SDK on a
+scripted transport), Poppler is stubbed except where a test says otherwise.
 """
 import subprocess
 from pathlib import Path
@@ -12,22 +12,25 @@ import pytest
 from pdf2image.exceptions import PDFInfoNotInstalledError
 
 from handlers.document import (
+    AI_FAILURE_MESSAGES,
     ALLOWED_DOC_EXTENSIONS,
+    CHECKLIST_CAPTION,
     DOWNLOAD_ERROR_MSG,
     ERROR_MSG,
-    LOW_CONFIDENCE_MSG,
     REJECTION_MESSAGES,
     REPORT_CHAR_LIMIT,
     WAIT_DOC_MSG,
     WAIT_VOICE_MSG,
 )
-from services import limits, openai_service, pdf_converter
+from services import limits, pdf_converter
+from services.ai_errors import AIFailure, AIServiceError
 from services.openai_service import OpenAIService
 from services.pdf_converter import RenderedPage, RenderError
+from services.report import DISCLAIMER, REPORT_HEADER
 from services.validation import Rejection, validate_document
 from states.user_states import PENDING_FILE_KEY, WORKSPACE_KEY
 from tests import samples
-from tests.fakes import FakeBot, FakeMessage, FakeOpenAIClient, FakeOpenAIService, FakeTTSService
+from tests.fakes import FakeBot, FakeMessage, FakeOpenAIService, FakeTTSService, ScriptedOpenAI, make_report
 
 WAITING_FOR_DOCUMENT = "UserSessionState:waiting_for_document"
 WAITING_FOR_VOICE = "UserSessionState:waiting_for_voice"
@@ -46,12 +49,9 @@ INVALID_DOCUMENTS = [
 
 
 @pytest.fixture
-def paid(handler_env, monkeypatch):
-    """The OpenAI/TTS fakes the handlers will use. Their call records are the proof of what was paid for."""
-    openai, tts = FakeOpenAIService(), FakeTTSService()
-    monkeypatch.setattr(handler_env.document, "OpenAIService", lambda **kwargs: openai)
-    monkeypatch.setattr(handler_env.document, "TTSService", lambda **kwargs: tts)
-    return SimpleNamespace(openai=openai, tts=tts)
+def paid(handler_env):
+    """The OpenAI/TTS fakes the handlers receive. Their call records are the proof of what was paid for."""
+    return SimpleNamespace(openai=handler_env.ai.openai, tts=handler_env.ai.tts)
 
 
 def nothing_paid(paid) -> bool:
@@ -69,12 +69,17 @@ async def send(env, kind: str, state, unique_id: str = "x", *, name: str = "cont
         handler, remote = env.document.handle_document, f"remote/doc-{unique_id}"
     if data is not None:
         env.bot.payloads[remote] = data
-    await handler(message, state, env.bot)
+    await handler(message, state, env.bot, env.ai)
     return message
 
 
 def report_of(env) -> str:
     return env.bot.sent_texts[-1]
+
+
+def full_report(body: str, coverage: str) -> str:
+    """What the user receives: code header, the model's text, the code coverage line, the code disclaimer."""
+    return f"{REPORT_HEADER}\n\n{body}\n\nℹ️ {coverage}\n\n{DISCLAIMER}"
 
 
 # --- invalid documents: zero paid calls, whichever message arrives first ------------------------------------------
@@ -142,37 +147,35 @@ async def test_a_refused_voice_does_not_replace_or_open_anything(handler_env, pa
 
 @pytest.mark.parametrize("name, data, reason", INVALID_DOCUMENTS)
 async def test_the_pipeline_alone_refuses_invalid_documents_before_any_openai_call(
-    handler_env, tmp_path, monkeypatch, name, data, reason
+    handler_env, tmp_path, name, data, reason
 ):
-    """run_pipeline does not rely on the upload-time check. Real OpenAIService, fake client: count what would be billed."""
-    client = FakeOpenAIClient(chat_replies=[])
-    monkeypatch.setattr(openai_service, "AsyncOpenAI", lambda api_key=None: client)
+    """run_pipeline does not rely on the upload-time check. Real OpenAIService on the real SDK: count what would be billed."""
+    openai = ScriptedOpenAI()  # any request would raise: nothing is scripted
     tts, bot = FakeTTSService(), FakeBot()
     (tmp_path / "voice.ogg").write_bytes(b"OggS-voice")
     (tmp_path / "doc.bin").write_bytes(data)
 
     await handler_env.document.run_pipeline(
-        bot, 1, tmp_path / "voice.ogg", tmp_path / "doc.bin", OpenAIService(api_key="offline"), tts, "pdf"
+        bot, 1, tmp_path / "voice.ogg", tmp_path / "doc.bin", OpenAIService(openai.client), tts, "pdf"
     )
 
-    assert client.chat_calls == 0 and client.transcribe_calls == 0 and tts.calls == 0
+    assert openai.requests == [] and tts.calls == 0
     assert REJECTION_MESSAGES[reason] in bot.sent_texts
     assert ERROR_MSG not in bot.sent_texts  # a permanent input problem is not reported as a transient failure
     assert bot.sent_voices == [] and bot.sent_documents == []
 
 
-async def test_an_empty_voice_is_refused_before_vision_is_paid_for(handler_env, tmp_path, monkeypatch):
-    client = FakeOpenAIClient(chat_replies=[])
-    monkeypatch.setattr(openai_service, "AsyncOpenAI", lambda api_key=None: client)
+async def test_an_empty_voice_is_refused_before_vision_is_paid_for(handler_env, tmp_path):
+    openai = ScriptedOpenAI()
     bot = FakeBot()
     (tmp_path / "voice.ogg").write_bytes(b"")
     (tmp_path / "scan.png").write_bytes(samples.png_bytes())
 
     await handler_env.document.run_pipeline(
-        bot, 1, tmp_path / "voice.ogg", tmp_path / "scan.png", OpenAIService(api_key="offline"), FakeTTSService(), "pdf"
+        bot, 1, tmp_path / "voice.ogg", tmp_path / "scan.png", OpenAIService(openai.client), FakeTTSService(), "pdf"
     )
 
-    assert client.chat_calls == 0 and client.transcribe_calls == 0  # neither Vision nor Whisper
+    assert openai.requests == []  # neither Vision nor Whisper
     assert REJECTION_MESSAGES[Rejection.EMPTY] in bot.sent_texts
 
 
@@ -203,7 +206,7 @@ async def test_a_valid_image_goes_validate_then_vision_then_whisper_then_analysi
     await send(env, "voice", state)
 
     assert paid.openai.calls == [
-        "extract_text_from_image", "transcribe_voice", "analyze_document", "generate_response_sections",
+        "extract_text_from_image", "transcribe_voice", "analyze_document", "generate_report",
     ]
     assert paid.openai.ocr_images[0].startswith(b"\xff\xd8\xff")  # the normalized JPEG, never the raw upload
 
@@ -216,7 +219,7 @@ async def test_a_born_digital_pdf_is_never_sent_to_vision(handler_env, paid, mon
     await send(env, "voice", state)
     await send(env, "document", state, name="contract.pdf", data=samples.text_pdf(2))
 
-    assert paid.openai.calls == ["transcribe_voice", "analyze_document", "generate_response_sections"]
+    assert paid.openai.calls == ["transcribe_voice", "analyze_document", "generate_report"]
     assert "CLAUSE-1" in paid.openai.analysis_inputs[0] and "CLAUSE-2" in paid.openai.analysis_inputs[0]
 
 
@@ -244,28 +247,6 @@ async def test_the_file_extension_is_not_trusted_in_either_direction(handler_env
     await send(env, "document", state, "b", name="photo.png", data=samples.text_pdf(1))  # a PDF named .png
     await send(env, "voice", state, "b")
     assert paid.openai.calls[0] == "transcribe_voice"  # processed as a text PDF: no Vision
-
-
-async def test_low_confidence_no_longer_triggers_a_second_pdf_text_pass(handler_env, paid, monkeypatch):
-    """
-    Stage 3 behaviour change, pinned on purpose: the old fallback re-read the PDF text layer after a low-confidence
-    Vision pass. The text layer is now read first, so a second pass would only re-send the same text.
-    The threshold, parse_confidence and the user message are unchanged.
-    """
-    env = handler_env
-
-    async def unreadable(self, voice_transcript, document_text):
-        self.calls.append("analyze_document")
-        return {"document_type": "?", "confidence": 10}
-
-    monkeypatch.setattr(FakeOpenAIService, "analyze_document", unreadable)
-    state = env.new_state()
-    await send(env, "document", state, name="contract.pdf", data=samples.text_pdf(1))
-
-    await send(env, "voice", state)
-
-    assert paid.openai.calls.count("analyze_document") == 1
-    assert LOW_CONFIDENCE_MSG in env.bot.sent_texts and env.bot.sent_voices == []
 
 
 # --- rendering problems are permanent, local and free ------------------------------------------------------------
@@ -326,7 +307,8 @@ async def test_the_report_for_an_image_says_the_uploaded_image_was_analysed(hand
     await send(env, "document", state)
     await send(env, "voice", state)
 
-    assert report_of(env) == "Отчёт\n\nℹ️ Проанализировано: загруженное изображение."
+    assert report_of(env) == full_report("Отчёт", "Проанализировано: загруженное изображение.")
+    assert env.bot.document_captions == [CHECKLIST_CAPTION]  # the checklist file carries the model-assessment note, too
 
 
 async def test_the_report_for_a_long_pdf_states_exactly_which_pages_were_analysed(handler_env, paid):
@@ -335,8 +317,8 @@ async def test_the_report_for_a_long_pdf_states_exactly_which_pages_were_analyse
     await send(env, "document", state, name="long.pdf", data=samples.text_pdf(12))
     await send(env, "voice", state)
 
-    assert report_of(env) == (
-        "Отчёт\n\nℹ️ Проанализированы только страницы 1–5 из 12. Страницы 6–12 в анализ не вошли."
+    assert report_of(env) == full_report(
+        "Отчёт", "Проанализированы только страницы 1–5 из 12. Страницы 6–12 в анализ не вошли."
     )
     analysed = paid.openai.analysis_inputs[0]
     assert "CLAUSE-5" in analysed and "CLAUSE-6" not in analysed  # what the report claims is what the model saw
@@ -348,39 +330,41 @@ async def test_a_pdf_within_budget_reports_all_its_pages(handler_env, paid):
     await send(env, "document", state, name="short.pdf", data=samples.text_pdf(3))
     await send(env, "voice", state)
 
-    assert report_of(env).endswith("ℹ️ Проанализированные страницы: 1–3 из 3.")
+    assert "ℹ️ Проанализированные страницы: 1–3 из 3." in report_of(env)
 
 
-async def test_the_coverage_line_cannot_be_cut_off_by_a_long_model_report(handler_env, paid, monkeypatch):
+async def test_the_coverage_line_and_the_disclaimer_cannot_be_cut_off_by_a_long_model_report(handler_env, paid, monkeypatch):
     env = handler_env
 
     async def endless_report(self, **kwargs):
-        return {"text_report": "x" * 10_000, "tts_script": "s", "checklist": "□ c"}
+        return make_report("x" * 10_000)
 
-    monkeypatch.setattr(FakeOpenAIService, "generate_response_sections", endless_report)
+    monkeypatch.setattr(FakeOpenAIService, "generate_report", endless_report)
     state = env.new_state()
     await send(env, "document", state, name="long.pdf", data=samples.text_pdf(12))
     await send(env, "voice", state)
 
     report = report_of(env)
     assert len(report) <= REPORT_CHAR_LIMIT
-    assert report.endswith("Страницы 6–12 в анализ не вошли.")
+    assert report.startswith(REPORT_HEADER)
+    assert report.endswith(f"ℹ️ Проанализированы только страницы 1–5 из 12. Страницы 6–12 в анализ не вошли.\n\n{DISCLAIMER}")
 
 
-async def test_no_coverage_line_is_sent_when_nothing_was_reported(handler_env, paid, monkeypatch):
-    """Low-quality documents get the existing quality message, not a report with a coverage footer."""
+async def test_a_model_service_failure_sends_only_its_message_never_a_report_or_a_coverage_line(handler_env, paid, monkeypatch):
     env = handler_env
 
-    async def unreadable(self, voice_transcript, document_text):
-        return {"document_type": "?", "confidence": 5}
+    async def invalid_output(self, voice_transcript, document_text):
+        raise AIServiceError(AIFailure.INVALID_OUTPUT, "ValidationError")
 
-    monkeypatch.setattr(FakeOpenAIService, "analyze_document", unreadable)
+    monkeypatch.setattr(FakeOpenAIService, "analyze_document", invalid_output)
     state = env.new_state()
     await send(env, "document", state)
     await send(env, "voice", state)
 
-    assert LOW_CONFIDENCE_MSG in env.bot.sent_texts
-    assert not any("ℹ️" in text for text in env.bot.sent_texts)
+    assert AI_FAILURE_MESSAGES[AIFailure.INVALID_OUTPUT] in env.bot.sent_texts
+    assert not any("ℹ️" in text or DISCLAIMER in text for text in env.bot.sent_texts)
+    assert env.bot.sent_voices == [] and env.bot.sent_documents == []
+    assert env.leftover_files() == []
 
 
 # --- before the download --------------------------------------------------------------------------------------------
@@ -486,16 +470,15 @@ async def test_a_tiny_pdf_with_absurd_page_dimensions_is_refused_by_preflight_be
         monkeypatch.setattr(pdf_converter, name, must_not_run)
     monkeypatch.setattr(subprocess, "Popen", must_not_run)
 
-    client = FakeOpenAIClient(chat_replies=[])
-    monkeypatch.setattr(openai_service, "AsyncOpenAI", lambda api_key=None: client)
+    openai = ScriptedOpenAI()
     bot = FakeBot()
     (tmp_path / "voice.ogg").write_bytes(b"OggS-voice")
     (tmp_path / "hostile.pdf").write_bytes(hostile)
 
     assert validate_document(tmp_path / "hostile.pdf") is Rejection.PAGE_SIZE
     await handler_env.document.run_pipeline(
-        bot, 1, tmp_path / "voice.ogg", tmp_path / "hostile.pdf", OpenAIService(api_key="offline"), FakeTTSService(), "pdf"
+        bot, 1, tmp_path / "voice.ogg", tmp_path / "hostile.pdf", OpenAIService(openai.client), FakeTTSService(), "pdf"
     )
 
     assert REJECTION_MESSAGES[Rejection.PAGE_SIZE] in bot.sent_texts
-    assert client.chat_calls == 0 and client.transcribe_calls == 0
+    assert openai.requests == []

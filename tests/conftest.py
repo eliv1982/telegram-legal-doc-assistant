@@ -19,13 +19,22 @@ from tests.fakes import FakeBot, FakeOpenAIService, FakeTTSService, ObservedIsol
 
 # config.py calls load_dotenv() at import time. Stub it before anything imports `config`, so a developer's
 # real .env (with live secrets) can never leak into the test process, and drop any ambient settings.
+# (Hence nothing above this point, tests.fakes included, may import a module that imports `config`.)
 dotenv.load_dotenv = lambda *args, **kwargs: False
 for _name in (
     "BOT_TOKEN",
     "OPENAI_API_KEY",
     "SESSION_TIMEOUT_MINUTES",
     "CHECKLIST_FORMAT",
-    "CONFIDENCE_THRESHOLD",
+    "OPENAI_TIMEOUT_SECONDS",
+    "OPENAI_MAX_RETRIES",
+    "OPENAI_TRANSCRIPTION_MODEL",
+    "OPENAI_TRANSCRIPTION_LANGUAGE",
+    "OPENAI_VISION_MODEL",
+    "OPENAI_ANALYSIS_MODEL",
+    "OPENAI_REPORT_MODEL",
+    "OPENAI_TTS_MODEL",
+    "OPENAI_TTS_VOICE",
 ):
     os.environ.pop(_name, None)
 
@@ -80,6 +89,7 @@ class HandlerEnv:
     bot: FakeBot
     temp_dir: Path
     document: object  # the handlers.document module
+    ai: object  # services.openai_client.AIServices: what the handlers receive from aiogram's workflow_data; a test may swap `ai.openai` / `ai.tts`
     pipeline_calls: list[int] = field(default_factory=list)
     pipeline_args: list[tuple] = field(default_factory=list)  # (bot, user_id, voice_path, doc_path, ...) per run
     storage: MemoryStorage = field(default_factory=MemoryStorage)
@@ -95,16 +105,17 @@ class HandlerEnv:
 def handler_env(monkeypatch, tmp_path) -> HandlerEnv:
     import config
     from handlers import document
+    from services.openai_client import AIServices
 
     # Session workspaces are created under tempfile.gettempdir(); point it at the per-test directory.
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setattr(config, "CONFIDENCE_THRESHOLD", 70)
     monkeypatch.setattr(config, "SESSION_TIMEOUT_MINUTES", 10)
-    monkeypatch.setattr(document, "OpenAIService", lambda **kwargs: FakeOpenAIService())
-    monkeypatch.setattr(document, "TTSService", lambda **kwargs: FakeTTSService())
-    monkeypatch.setattr(document, "generate_checklist", lambda text, output_format="pdf": b"%PDF-placeholder")
+    monkeypatch.setattr(document, "generate_checklist", lambda items, output_format="pdf": b"%PDF-placeholder")
 
-    env = HandlerEnv(bot=FakeBot(), temp_dir=tmp_path, document=document)
+    env = HandlerEnv(
+        bot=FakeBot(), temp_dir=tmp_path, document=document,
+        ai=AIServices(openai=FakeOpenAIService(), tts=FakeTTSService()),
+    )
     real_run_pipeline = document.run_pipeline
 
     async def counting_run_pipeline(*args, **kwargs):
@@ -136,8 +147,10 @@ class DispatchEnv:
 def _app_dispatcher():
     # The module-level routers attach to a single parent, so the app's dispatcher can be built once per process.
     from bot import build_dispatcher
+    from services.openai_client import AIServices
 
-    return build_dispatcher()
+    # Placeholder services: the `dispatch` fixture swaps in each test's own via workflow_data.
+    return build_dispatcher(AIServices(openai=FakeOpenAIService(), tts=FakeTTSService()))
 
 
 @pytest.fixture
@@ -145,6 +158,7 @@ def dispatch(handler_env, _app_dispatcher, monkeypatch) -> DispatchEnv:
     # Fresh locks per test (an asyncio.Lock binds to the loop of its first contention), same class as the app's.
     isolation = ObservedIsolation(type(_app_dispatcher.fsm.events_isolation)())
     monkeypatch.setattr(_app_dispatcher.fsm, "events_isolation", isolation)
+    monkeypatch.setitem(_app_dispatcher.workflow_data, "ai", handler_env.ai)
 
     # aiogram runs sync callbacks (the F.voice / F.document magic filters) via asyncio.to_thread. That is a real
     # thread hop, so how far a second update gets while the first is parked would depend on thread timing.

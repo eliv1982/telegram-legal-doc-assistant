@@ -23,7 +23,7 @@ async def send(env, kind: str, state, unique_id: str = "x", user_id: int = 1) ->
         message, handler = FakeMessage.with_voice(unique_id, user_id), env.document.handle_voice
     else:
         message, handler = FakeMessage.with_document(unique_id=unique_id, user_id=user_id), env.document.handle_document
-    await handler(message, state, env.bot)
+    await handler(message, state, env.bot, env.ai)
     return message
 
 

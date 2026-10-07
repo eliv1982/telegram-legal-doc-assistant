@@ -3,6 +3,7 @@
 """
 import io
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -11,6 +12,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+
+from services.schemas import PRIORITY_LABELS, PRIORITY_ORDER, ChecklistItem
 
 logger = logging.getLogger(__name__)
 
@@ -32,34 +35,27 @@ for _path in [
 CHECKBOX = "☐"
 
 
-def parse_checklist_text(text: str) -> list[str]:
-    """
-    Извлекает пункты чек-листа из текста.
-    Поддерживает форматы: □ пункт, ☐ пункт, - пункт, * пункт, 1. пункт
-    """
-    lines = text.strip().split("\n")
-    items: list[str] = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        for prefix in ("□", "☐", "☑", "-", "*", "•"):
-            if line.startswith(prefix):
-                line = line[len(prefix) :].strip()
-                break
-        if line and not line.startswith("=="):
-            items.append(line)
-    return items or [text[:200]]
+NO_ITEMS_LINE = "Пунктов для проверки модель не предложила."
 
 
-def generate_checklist_pdf(checklist_text: str, output_path: str | Path | None = None) -> bytes:
+def checklist_lines(items: Sequence[ChecklistItem]) -> list[str]:
+    """
+    Строки чек-листа из структурных пунктов модели: сначала высокий приоритет, затем средний и низкий.
+    Приоритет — оценка модели, поэтому он остаётся видимой меткой пункта.
+    """
+    ordered = sorted(items, key=lambda item: PRIORITY_ORDER.index(item.priority))  # сортировка устойчива
+    lines = [f"[{PRIORITY_LABELS[item.priority]}] {item.text}" for item in ordered]
+    return lines or [NO_ITEMS_LINE]
+
+
+def generate_checklist_pdf(items: Sequence[ChecklistItem], output_path: str | Path | None = None) -> bytes:
     """
     Создаёт PDF с чек-листом.
-    :param checklist_text: текст чек-листа (с маркерами □)
+    :param items: структурные пункты чек-листа
     :param output_path: необязательно — путь для сохранения
     :return: байты PDF
     """
-    items = parse_checklist_text(checklist_text)
+    lines = checklist_lines(items)
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     width, height = A4
@@ -67,7 +63,7 @@ def generate_checklist_pdf(checklist_text: str, output_path: str | Path | None =
     line_height = 24
     font_name = "CyrillicFont" if _CYRILLIC_FONT_REGISTERED else "Helvetica"
     c.setFont(font_name, 12)
-    for item in items:
+    for item in lines:
         if y < 50:
             c.showPage()
             c.setFont(font_name, 12)
@@ -85,16 +81,16 @@ def generate_checklist_pdf(checklist_text: str, output_path: str | Path | None =
     return pdf_bytes
 
 
-def generate_checklist_image(checklist_text: str, output_path: str | Path | None = None) -> bytes:
+def generate_checklist_image(items: Sequence[ChecklistItem], output_path: str | Path | None = None) -> bytes:
     """
     Создаёт PNG-изображение с чек-листом.
     :return: байты PNG
     """
-    items = parse_checklist_text(checklist_text)
+    lines = checklist_lines(items)
     line_height = 32
     padding = 40
     width = 600
-    height = padding * 2 + len(items) * line_height
+    height = padding * 2 + len(lines) * line_height
 
     img = Image.new("RGB", (width, height), color=(255, 255, 255))
     draw = ImageDraw.Draw(img)
@@ -117,7 +113,7 @@ def generate_checklist_image(checklist_text: str, output_path: str | Path | None
         font = ImageFont.load_default()
 
     y = padding
-    for item in items:
+    for item in lines:
         text_line = f"{CHECKBOX} {item}"
         if len(text_line) > 70:
             text_line = text_line[:67] + "..."
@@ -134,7 +130,7 @@ def generate_checklist_image(checklist_text: str, output_path: str | Path | None
 
 
 def generate_checklist(
-    checklist_text: str,
+    items: Sequence[ChecklistItem],
     output_format: Literal["pdf", "png"] = "pdf",
     output_path: str | Path | None = None,
 ) -> bytes:
@@ -142,5 +138,5 @@ def generate_checklist(
     Универсальная функция: создаёт чек-лист в указанном формате.
     """
     if output_format == "png":
-        return generate_checklist_image(checklist_text, output_path)
-    return generate_checklist_pdf(checklist_text, output_path)
+        return generate_checklist_image(items, output_path)
+    return generate_checklist_pdf(items, output_path)
