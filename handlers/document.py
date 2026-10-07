@@ -24,11 +24,12 @@ from states.user_states import (
 from services import limits
 from services.ai_errors import AIFailure, AIServiceError
 from services.checklist_generator import generate_checklist
-from services.document_extraction import extract_document, format_coverage
+from services.deterministic_checks import CheckStatus, run_deterministic_checks
+from services.document_extraction import METHOD_VISION, DocumentExtractionResult, extract_document, format_coverage
 from services.grounding import ground_issues
 from services.openai_client import AIServices
 from services.openai_service import OpenAIService
-from services.report import compose_report, compose_tts_script
+from services.report import compose_report, compose_tts_script, format_automatic_checks
 from services.tts_service import TTS_INPUT_LIMIT, TTSService
 from services.validation import (
     Rejection,
@@ -121,9 +122,11 @@ async def run_pipeline(
     checklist_format: str,
 ) -> None:
     """
-    Полный пайплайн: проверка файлов → извлечение документа → транскрибация → анализ → пост-обработка → TTS →
-    чек-лист → отправка. Проверка и извлечение идут до Whisper, поэтому за транскрибацию задачи к непригодному
-    документу платить не приходится; сама проверка бесплатна и локальна.
+    Полный пайплайн: проверка файлов → извлечение документа → автоматические проверки реквизитов → транскрибация →
+    анализ → пост-обработка → TTS → чек-лист → отправка. Проверка и извлечение идут до Whisper, поэтому за
+    транскрибацию задачи к непригодному документу платить не приходится; сама проверка бесплатна и локальна.
+    Автоматические проверки — тоже бесплатный локальный код по тексту документа: модель их не видит, и они не
+    влияют на её анализ.
     """
     try:
         status_msg = await bot.send_message(user_id, "⏳ Обрабатываю…")
@@ -144,11 +147,14 @@ async def run_pipeline(
             len(extraction.extracted_text), len(extraction.analysed_pages), extraction.total_pages,
         )
 
-        # 3. Транскрибация голоса
+        # 3. Автоматические проверки реквизитов: код по тексту документа, не по ответам модели. Не блокируют анализ.
+        automatic_checks = _automatic_checks_section(extraction)
+
+        # 4. Транскрибация голоса
         transcript = await openai_service.transcribe_voice(voice_path)
         logger.info("Transcribed: %d chars", len(transcript))
 
-        # 4. Анализ: типизированный результат модели. Сбой формата, отказ и обрыв — это AIServiceError, а не «плохой документ».
+        # 5. Анализ: типизированный результат модели. Сбой формата, отказ и обрыв — это AIServiceError, а не «плохой документ».
         analysis = await openai_service.analyze_document(transcript, extraction.analysis_text)
         # Цитаты проверяются по тексту документа (без служебной пометки об охвате, которую добавляет код).
         findings = ground_issues(analysis.issues, extraction.extracted_text)
@@ -157,22 +163,24 @@ async def run_pipeline(
             len(findings), sum(1 for finding in findings if finding.verified_evidence),
         )
 
-        # 5. Пост-обработка: отчёт, текст озвучки и пункты чек-листа приходят структурой, а не разбираются из текста.
+        # 6. Пост-обработка: отчёт, текст озвучки и пункты чек-листа приходят структурой, а не разбираются из текста.
         report = await openai_service.generate_report(task=transcript, analysis=analysis)
 
-        # 6. TTS
+        # 7. TTS
         tts_bytes = await tts_service.text_to_speech(compose_tts_script(report.tts_script, limit=TTS_INPUT_LIMIT))
 
-        # 7. Чек-лист (reportlab/Pillow блокируют поток, поэтому в отдельный поток)
+        # 8. Чек-лист (reportlab/Pillow блокируют поток, поэтому в отдельный поток)
         checklist_bytes = await asyncio.to_thread(generate_checklist, report.checklist_items, output_format=checklist_format)
         checklist_ext = "pdf" if checklist_format == "pdf" else "png"
 
-        # 8. Отправка
+        # 9. Отправка
         await status_msg.edit_text("📤 Отправляю результат…")
-        # Заголовок «оценка модели», цитаты, строка охвата и дисклеймер формируются кодом и добавляются после
-        # сокращения текста модели, поэтому не могут потеряться. Если Markdown вызывает ошибку — шлём без форматирования.
+        # Раздел автоматических проверок, заголовок «оценка модели», цитаты, строка охвата и дисклеймер формируются
+        # кодом и добавляются после сокращения текста модели, поэтому не могут потеряться. Если Markdown вызывает
+        # ошибку — шлём без форматирования.
         report_text = compose_report(
-            report.text_report, findings, format_coverage(extraction), limit=REPORT_CHAR_LIMIT
+            report.text_report, findings, format_coverage(extraction), limit=REPORT_CHAR_LIMIT,
+            automatic=automatic_checks,
         )
         try:
             await bot.send_message(user_id, report_text, parse_mode="Markdown")
@@ -193,6 +201,23 @@ async def run_pipeline(
     except Exception as e:
         log_failure(logger, "pipeline", e)
         await bot.send_message(user_id, ERROR_MSG)
+
+
+def _automatic_checks_section(extraction: DocumentExtractionResult) -> str:
+    """
+    Готовый раздел отчёта с автоматическими проверками реквизитов. Вход — только текст документа; результаты модель
+    не видит. Это необязательный слой: его внутренний сбой не лишает пользователя оценки модели, но об этом
+    сообщается в отчёте. В лог идут только количества, не значения реквизитов.
+    """
+    try:
+        checks = run_deterministic_checks(extraction.extracted_text, analysed_pages=extraction.analysed_pages)
+    except Exception as e:
+        log_failure(logger, "automatic_checks", e)
+        return format_automatic_checks(None)
+    logger.info(
+        "Automatic checks: %d, failed %d", len(checks), sum(1 for check in checks if check.status is CheckStatus.FAIL)
+    )
+    return format_automatic_checks(checks, ocr_used=METHOD_VISION in extraction.extraction_methods)
 
 
 def _validate_inputs(doc_path: Path, voice_path: Path) -> ValidatedDocument | Rejection:
